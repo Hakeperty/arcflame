@@ -177,9 +177,32 @@ impl NodeAgent for ArcFlareNodeService {
 
     async fn forward_stream(
         &self,
-        _request: Request<Streaming<ForwardRequest>>,
+        request: Request<Streaming<ForwardRequest>>,
     ) -> Result<Response<Self::ForwardStreamStream>, Status> {
-        Err(Status::unimplemented("Streaming forward not yet implemented"))
+        #[cfg(feature = "inference")]
+        {
+            use tokio_stream::StreamExt;
+            let mut stream = request.into_inner();
+
+            let output = async_stream::try_stream! {
+                while let Some(req) = stream.next().await {
+                    let req = req?;
+                    let resp = crate::inference::forward(req).await
+                        .map_err(|e| Status::internal(format!("Forward: {}", e)))?;
+                    yield resp;
+                }
+            };
+
+            return Ok(Response::new(Box::pin(output) as Self::ForwardStreamStream));
+        }
+
+        #[cfg(not(feature = "inference"))]
+        {
+            let _ = request;
+            Err(Status::unimplemented(
+                "Inference support not compiled. Build with --features inference"
+            ))
+        }
     }
 
     async fn unload_shard(

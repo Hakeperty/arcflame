@@ -10,25 +10,28 @@ use llama_cpp_4::{llama_backend::LlamaBackend, model::LlamaModel, model::params:
 static CURRENT_SHARD: once_cell::sync::OnceCell<Arc<RwLock<Option<ShardState>>>> =
     once_cell::sync::OnceCell::new();
 
-struct ShardState {
-    model_name: String,
-    first_layer: i32,
-    num_layers: i32,
-    has_lm_head: bool,
+pub struct ShardState {
+    pub model_name: String,
+    pub first_layer: i32,
+    pub num_layers: i32,
+    pub has_lm_head: bool,
     #[cfg(feature = "inference")]
-    model: Option<LlamaModel>,
+    pub model: Option<LlamaModel>,
+}
+
+pub async fn get_loaded_model() -> Option<Arc<RwLock<Option<ShardState>>>> {
+    CURRENT_SHARD.get().map(|c| c.clone())
 }
 
 pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String> {
     let start = std::time::Instant::now();
 
-    // Initialize llama backend if not already
     #[cfg(feature = "inference")]
     {
         let backend = LlamaBackend::init()
             .map_err(|e| format!("Failed to init backend: {}", e))?;
         let params = LlamaModelParams::default()
-            .with_n_gpu_layers(999); // Offload all to GPU if available
+            .with_n_gpu_layers(999);
         let model = LlamaModel::load_from_file(
             &backend,
             &config.gguf_path,
@@ -58,12 +61,11 @@ pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String>
 
     #[cfg(not(feature = "inference"))]
     {
-        // Stub: simulate loading
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let elapsed = start.elapsed();
         Ok(LoadStatus {
             loaded: true,
-            memory_used_bytes: 512 * 1024 * 1024, // Simulated 512MB
+            memory_used_bytes: 512 * 1024 * 1024,
             layers_loaded: config.num_layers,
             load_time_ms: elapsed.as_millis() as i64,
             error: String::new(),
