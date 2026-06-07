@@ -161,6 +161,8 @@ arcflare/
 - [ ] Custom layer partitioning engine
 - [ ] llama-cpp-4 inference integration
 - [ ] KV cache optimization
+### Phase 2 (maybes)
+- [ ] Quantizing and training opportunity
 
 ### Phase 3 🔜
 - [ ] Web dashboard
