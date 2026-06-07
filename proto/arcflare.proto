@@ -1,0 +1,304 @@
+syntax = "proto3";
+
+package arcflare;
+
+// ─── Node Agent Service (runs on each old device) ───
+
+service NodeAgent {
+  // Lifecycle
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Hardware
+  rpc GetHardwareInfo(Empty) returns (HardwareReport);
+  rpc RunBenchmark(BenchmarkRequest) returns (BenchmarkResult);
+
+  // Overclocking & Tuning
+  rpc SetPerformanceMode(PerfModeRequest) returns (PerfModeResponse);
+  rpc GetOverclockingStatus(Empty) returns (OverclockingStatus);
+
+  // Drivers
+  rpc CheckDrivers(Empty) returns (DriverReport);
+
+  // System Tuning
+  rpc ApplySystemTuning(TuningRequest) returns (TuningResponse);
+
+  // Inference
+  rpc LoadShard(ShardConfig) returns (LoadStatus);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc ForwardStream(stream ForwardRequest) returns (stream ForwardResponse);
+  rpc UnloadShard(Empty) returns (Empty);
+  rpc GetInferenceStats(Empty) returns (InferenceStats);
+}
+
+// ─── Orchestrator Service (for nodes to report back) ───
+
+service Orchestrator {
+  rpc ReportNodeStatus(NodeStatus) returns (Empty);
+  rpc RequestPartition(PartitionRequest) returns (PartitionAssignment);
+}
+
+// ─── Messages ───
+
+message Empty {}
+
+message RegisterRequest {
+  string node_id = 1;
+  string node_name = 2;
+  string version = 3;
+  string os = 4;
+  uint32 grpc_port = 5;
+  repeated string capabilities = 6;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string orchestrator_id = 2;
+  string session_token = 3;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string session_token = 2;
+  HardwareStatus status = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  repeated OrchestratorCommand commands = 2;
+}
+
+message HardwareStatus {
+  double cpu_usage = 1;
+  double memory_usage = 2;
+  double temperature_celsius = 3;
+  bool is_throttling = 4;
+  int64 uptime_seconds = 5;
+}
+
+message OrchestratorCommand {
+  string command_id = 1;
+  string action = 2;
+  bytes payload = 3;
+}
+
+// ─── Hardware Report ───
+
+message HardwareReport {
+  string node_id = 1;
+  CPUInfo cpu = 2;
+  repeated GPUInfo gpus = 3;
+  MemoryInfo memory = 4;
+  DiskInfo disk = 5;
+  NetworkInfo network = 6;
+  double benchmark_score = 7;
+}
+
+message CPUInfo {
+  string model = 1;
+  uint32 cores = 2;
+  uint32 threads = 3;
+  double max_freq_ghz = 4;
+  double min_freq_ghz = 5;
+  string architecture = 6;
+  bool has_avx2 = 7;
+  bool has_avx512 = 8;
+  bool has_neon = 9;
+  string governor = 10;
+}
+
+message GPUInfo {
+  string name = 1;
+  string vendor = 2;
+  string driver = 3;
+  uint64 vram_bytes = 4;
+  bool available = 5;
+  double compute_benchmark = 6;
+}
+
+message MemoryInfo {
+  uint64 total_bytes = 1;
+  uint64 available_bytes = 2;
+  uint64 swap_total_bytes = 3;
+  uint64 swap_available_bytes = 4;
+  uint64 hugepage_size_kb = 5;
+  uint64 hugepages_total = 6;
+  uint64 hugepages_free = 7;
+}
+
+message DiskInfo {
+  uint64 total_bytes = 1;
+  uint64 available_bytes = 2;
+  bool is_ssd = 3;
+  double read_speed_mbps = 4;
+  double write_speed_mbps = 5;
+}
+
+message NetworkInfo {
+  string hostname = 1;
+  repeated string ip_addresses = 2;
+  uint32 discovery_port = 3;
+  repeated LinkInfo links = 4;
+}
+
+message LinkInfo {
+  string interface_name = 1;
+  uint64 speed_bps = 2;
+  double latency_ms = 3;
+}
+
+// ─── Benchmarking ───
+
+message BenchmarkRequest {
+  string benchmark_type = 1;
+}
+
+message BenchmarkResult {
+  double score = 1;
+  double tokens_per_second = 2;
+  double memory_bandwidth_gbps = 3;
+  double compute_flops = 4;
+  map<string, double> details = 5;
+}
+
+// ─── Overclocking ───
+
+message PerfModeRequest {
+  enum Mode {
+    SAFE = 0;
+    AGGRESSIVE = 1;
+    CUSTOM = 2;
+  }
+  Mode mode = 1;
+  map<string, string> overrides = 2;
+}
+
+message PerfModeResponse {
+  bool applied = 1;
+  string message = 2;
+  map<string, string> before = 3;
+  map<string, string> after = 4;
+}
+
+message OverclockingStatus {
+  string current_mode = 1;
+  double temperature_celsius = 2;
+  bool is_throttling = 3;
+  double cpu_freq_ghz = 4;
+  double gpu_freq_mhz = 5;
+  int64 uptime_seconds = 6;
+}
+
+// ─── Drivers ───
+
+message DriverReport {
+  repeated DriverInfo drivers = 1;
+  repeated string missing_firmware = 2;
+  repeated string recommendations = 3;
+  bool up_to_date = 4;
+}
+
+message DriverInfo {
+  string device = 1;
+  string current_driver = 2;
+  string latest_available = 3;
+  string status = 4;
+  string recommendation = 5;
+}
+
+// ─── System Tuning ───
+
+message TuningRequest {
+  bool set_performance_governor = 1;
+  bool set_hugepages = 2;
+  uint64 hugepages_count = 3;
+  bool set_swappiness = 4;
+  uint32 swappiness_value = 5;
+  bool set_io_scheduler = 6;
+  string io_scheduler = 7;
+  bool set_thp_mode = 8;
+  string thp_mode = 9;
+  bool disable_numa_balancing = 10;
+}
+
+message TuningResponse {
+  bool applied = 1;
+  repeated string changes_made = 2;
+  repeated string errors = 3;
+}
+
+// ─── Inference ───
+
+message ShardConfig {
+  string model_name = 1;
+  string shard_path = 2;
+  int32 first_layer = 3;
+  int32 num_layers = 4;
+  bool has_lm_head = 5;
+  int32 max_context_length = 6;
+  string gguf_path = 7;
+  repeated string peer_addresses = 8;
+}
+
+message LoadStatus {
+  bool loaded = 1;
+  int64 memory_used_bytes = 2;
+  int32 layers_loaded = 3;
+  int64 load_time_ms = 4;
+  string error = 5;
+}
+
+message ForwardRequest {
+  bytes hidden_state = 1;
+  // For KV cache updates between nodes
+  int32 start_layer = 2;
+  int32 num_layers = 3;
+  repeated int32 input_ids = 4;
+}
+
+message ForwardResponse {
+  bytes hidden_state = 1;
+  bytes logits = 2;
+  bool has_logits = 3;
+  int64 compute_time_ms = 4;
+}
+
+message InferenceStats {
+  int32 layers_loaded = 1;
+  int64 total_forward_calls = 2;
+  double avg_forward_time_ms = 3;
+  int64 total_tokens_processed = 4;
+  int64 kv_cache_used_bytes = 5;
+  int64 peak_memory_bytes = 6;
+}
+
+// ─── Orchestrator Messages ───
+
+message NodeStatus {
+  string node_id = 1;
+  string state = 2;
+  HardwareReport hardware = 3;
+  double current_temperature = 4;
+  double current_load = 5;
+}
+
+message PartitionRequest {
+  string model_name = 1;
+  int64 model_size_bytes = 2;
+  int32 num_layers = 3;
+  int32 max_context = 4;
+}
+
+message PartitionAssignment {
+  string model_name = 1;
+  repeated NodePartition partitions = 2;
+}
+
+message NodePartition {
+  string node_id = 1;
+  int32 first_layer = 2;
+  int32 num_layers = 3;
+  bool has_lm_head = 4;
+  string shard_download_url = 5;
+  repeated string peer_seeders = 6;
+}

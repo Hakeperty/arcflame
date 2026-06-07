@@ -1,0 +1,57 @@
+[package]
+name = "node-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hardware detection
+sysinfo = "0.33"
+machine-uid = "0.2"
+cached = "0.54"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Networking
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+once_cell = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# For subprocess management
+# (llama-cpp-4 is optional — depends on platform features)
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[features]
+default = []
+inference = ["llama-cpp-4"]
+cuda = ["llama-cpp-4?/cuda"]
+metal = ["llama-cpp-4?/metal"]
+vulkan = ["llama-cpp-4?/vulkan"]
+
+[dependencies.llama-cpp-4]
+version = "0.3"
+optional = true
+default-features = false
+features = []
+

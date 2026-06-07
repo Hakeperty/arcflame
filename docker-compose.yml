@@ -1,0 +1,35 @@
+version: "3.9"
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - ARCFLARE_MODE=dev
+    volumes:
+      - ./models:/models
+      - ./orchestrator:/app
+
+  node-alpha:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      - ARCFLARE_NODE_NAME=alpha
+      - ARCFLARE_ORCHESTRATOR=orchestrator:8000
+    volumes:
+      - ./models:/models
+    depends_on: [orchestrator]
+
+  node-beta:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      - ARCFLARE_NODE_NAME=beta
+      - ARCFLARE_ORCHESTRATOR=orchestrator:8000
+    volumes:
+      - ./models:/models
+    depends_on: [orchestrator]

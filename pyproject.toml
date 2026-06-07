@@ -1,0 +1,20 @@
+[project]
+name = "arcflare"
+version = "0.1.0"
+description = "Distributed LLM inference for old/scrap hardware"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "grpcio>=1.67.0",
+    "grpcio-tools>=1.67.0",
+    "httpx>=0.28.0",
+    "huggingface-hub>=0.26.0",
+    "pydantic>=2.10.0",
+    "sse-starlette>=2.2.0",
+    "tomli>=2.2.0",
+]
+
+[project.scripts]
+arcflare = "arcflare.main:app"

@@ -1,0 +1,16 @@
+FROM rust:1.78-slim AS builder
+
+WORKDIR /app
+COPY node-agent/ ./node-agent/
+COPY proto/ ./proto/
+COPY Cargo.toml ./
+
+RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release -p node-agent
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates cpupower && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/node-agent /usr/local/bin/arcflare-node
+
+CMD ["arcflare-node", "--grpc-port", "9001"]

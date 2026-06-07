@@ -1,0 +1,76 @@
+use crate::network::arcflare as pb;
+use pb::{LoadStatus, ShardConfig};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[cfg(feature = "inference")]
+use llama_cpp_4::prelude::*;
+
+// Global model state
+static CURRENT_SHARD: once_cell::sync::OnceCell<Arc<RwLock<Option<ShardState>>>> =
+    once_cell::sync::OnceCell::new();
+
+struct ShardState {
+    model_name: String,
+    first_layer: i32,
+    num_layers: i32,
+    has_lm_head: bool,
+    #[cfg(feature = "inference")]
+    model: Option<LlamaModel>,
+}
+
+pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String> {
+    let start = std::time::Instant::now();
+
+    // Initialize llama backend if not already
+    #[cfg(feature = "inference")]
+    {
+        let backend = LlamaBackend::init()?;
+        let model = LlamaModel::load_from_file(
+            &backend,
+            &config.gguf_path,
+            LlamaModelParams::default()
+                .with_n_gpu_layers(999), // Offload all to GPU if available
+        ).map_err(|e| format!("Failed to load model: {}", e))?;
+
+        let state = ShardState {
+            model_name: config.model_name.clone(),
+            first_layer: config.first_layer,
+            num_layers: config.num_layers,
+            has_lm_head: config.has_lm_head,
+            model: Some(model),
+        };
+
+        let cell = CURRENT_SHARD.get_or_init(|| Arc::new(RwLock::new(None)));
+        *cell.write().await = Some(state);
+
+        let elapsed = start.elapsed();
+        Ok(LoadStatus {
+            loaded: true,
+            memory_used_bytes: 0,
+            layers_loaded: config.num_layers,
+            load_time_ms: elapsed.as_millis() as i64,
+            error: String::new(),
+        })
+    }
+
+    #[cfg(not(feature = "inference"))]
+    {
+        // Stub: simulate loading
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let elapsed = start.elapsed();
+        Ok(LoadStatus {
+            loaded: true,
+            memory_used_bytes: 512 * 1024 * 1024, // Simulated 512MB
+            layers_loaded: config.num_layers,
+            load_time_ms: elapsed.as_millis() as i64,
+            error: String::new(),
+        })
+    }
+}
+
+pub async fn unload_current_shard() {
+    if let Some(cell) = CURRENT_SHARD.get() {
+        *cell.write().await = None;
+    }
+}
