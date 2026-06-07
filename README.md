@@ -174,4 +174,4 @@ arcflare/
 
 MIT
 
-Built for the scrap hardware community. Give old devices a second life running AI.
+arcflame Built for revolution
