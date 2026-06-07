@@ -8,6 +8,8 @@ mod tuning;
 
 use clap::Parser;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -37,8 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(EnvFilter::new(&args.log_level))
         .init();
 
-    let node_id = machine_uid::get().unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    let hostname = hostname();
+    let hostname_cached = hostname();
+    let machine_id = machine_uid::get()
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| hostname_cached.clone());
+    let node_id = format!("{}-{}", machine_id, args.grpc_port);
+    let hostname = hostname_cached;
 
     let hardware_report = hardware::collect().await?;
     tracing::info!(
@@ -51,6 +58,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr: SocketAddr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
 
     let node_name = args.name.unwrap_or_else(|| hostname.clone());
+    let node_id_clone = node_id.clone();
+    let node_name_clone = node_name.clone();
+    let grpc_port = args.grpc_port;
+
+    // Start UDP discovery broadcaster
+    let shutdown = Arc::new(RwLock::new(false));
+    network::discovery::start_broadcaster(
+        node_id_clone,
+        node_name_clone,
+        grpc_port,
+        shutdown,
+    );
+
+    // Register with orchestrator via HTTP
+    if let Some(orchestrator_host) = args.orchestrator_host {
+        let orch_addr = format!("{}:{}", orchestrator_host, args.orchestrator_port);
+        let reg_url = format!("http://{}/api/nodes/register", orch_addr);
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "node_id": node_id,
+            "name": node_name,
+            "grpc_port": grpc_port,
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+        });
+        match client.post(&reg_url).json(&payload).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    tracing::info!("Registered with orchestrator at {}", orch_addr);
+                } else {
+                    tracing::warn!("Orchestrator registration failed: {}", resp.status());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not reach orchestrator at {}: {}", orch_addr, e);
+            }
+        }
+    }
 
     let node_svc = network::grpc_server::ArcFlareNodeService::new(
         node_id,

@@ -36,3 +36,11 @@ proto/*_pb2_grpc.py
 
 # Logs
 *.log
+
+# Local test scripts (not committed)
+tools/scripts/test-cluster.sh
+tools/scripts/test-docker.sh
+tools/llama-cli*
+
+# Test results
+tests/results/

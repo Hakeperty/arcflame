@@ -17,6 +17,38 @@ class NodeInfo(BaseModel):
     temperature: float | None = None
 
 
+class RegisterRequest(BaseModel):
+    node_id: str
+    name: str
+    grpc_port: int = 9001
+    version: str = "0.0.0"
+    os: str = "unknown"
+
+
+@router.post("/nodes/register")
+async def register_node(req: RegisterRequest):
+    from ..main import discovery_service
+    from ..cluster.discovery import NodeInfo
+    import time
+
+    if discovery_service is None:
+        raise HTTPException(503, "Discovery service not ready")
+
+    node_info = NodeInfo(
+        node_id=req.node_id,
+        node_name=req.name,
+        grpc_port=req.grpc_port,
+        version=req.version,
+        os=req.os,
+        ip_address="",
+        last_seen=time.time(),
+        status="alive",
+    )
+    discovery_service.nodes[req.node_id] = node_info
+    logger.info(f"Node registered via HTTP: {req.name} ({req.node_id})")
+    return {"status": "registered", "node_id": req.node_id}
+
+
 @router.get("/nodes")
 async def list_nodes():
     from ..main import discovery_service

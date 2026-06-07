@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "inference")]
-use llama_cpp_4::prelude::*;
+use llama_cpp_4::{llama_backend::LlamaBackend, model::LlamaModel, model::params::LlamaModelParams};
 
 // Global model state
 static CURRENT_SHARD: once_cell::sync::OnceCell<Arc<RwLock<Option<ShardState>>>> =
@@ -25,12 +25,14 @@ pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String>
     // Initialize llama backend if not already
     #[cfg(feature = "inference")]
     {
-        let backend = LlamaBackend::init()?;
+        let backend = LlamaBackend::init()
+            .map_err(|e| format!("Failed to init backend: {}", e))?;
+        let params = LlamaModelParams::default()
+            .with_n_gpu_layers(999); // Offload all to GPU if available
         let model = LlamaModel::load_from_file(
             &backend,
             &config.gguf_path,
-            LlamaModelParams::default()
-                .with_n_gpu_layers(999), // Offload all to GPU if available
+            &params,
         ).map_err(|e| format!("Failed to load model: {}", e))?;
 
         let state = ShardState {

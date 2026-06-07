@@ -26,41 +26,47 @@ class NodeInfo:
     ip_address: str = ""
 
 
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    def __init__(self, handler):
+        self.handler = handler
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr):
+        self.handler(data, addr)
+
+    def error_received(self, exc):
+        pass
+
+
 class DiscoveryService:
     def __init__(self):
         self.nodes: Dict[str, NodeInfo] = {}
         self._running = False
-        self._socket: Optional[socket.socket] = None
+        self._transport: Optional[asyncio.DatagramTransport] = None
 
     async def start(self):
         self._running = True
         loop = asyncio.get_event_loop()
 
-        # Create UDP socket for discovery
         try:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            self._socket.bind(("0.0.0.0", DISCOVERY_PORT))
-            self._socket.setblocking(False)
+            protocol = DiscoveryProtocol(self._handle_discovery)
+            self._transport, _ = await loop.create_datagram_endpoint(
+                lambda: protocol,
+                local_addr=("0.0.0.0", DISCOVERY_PORT),
+                allow_broadcast=True,
+            )
             logger.info(f"Discovery listening on UDP port {DISCOVERY_PORT}")
         except OSError as e:
             logger.warning(f"Could not bind UDP discovery port: {e}. Nodes must register manually.")
-            self._socket = None
             return
-
-        # Reader task
-        while self._running:
-            try:
-                data, addr = await loop.sock_recvfrom(self._socket, 8192)
-                self._handle_discovery(data, addr)
-            except (OSError, asyncio.TimeoutError):
-                await asyncio.sleep(0.1)
-
-        self._socket.close()
 
     def stop(self):
         self._running = False
+        if self._transport:
+            self._transport.close()
 
     def _handle_discovery(self, data: bytes, addr: tuple):
         try:

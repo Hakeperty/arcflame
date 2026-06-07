@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import AsyncGenerator, Optional
 
 logger = logging.getLogger("arcflare.inference")
@@ -19,6 +20,34 @@ class InferencePipeline:
     def __init__(self):
         self.active_pipelines: dict = {}
         self.node_connections: dict = {}
+
+    def _find_model(self, model_name: str) -> Optional[str]:
+        models_dir = os.environ.get(
+            "ARCFLARE_MODELS_DIR",
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"),
+        )
+        models_dir = os.path.abspath(models_dir)
+
+        # Map model name to GGUF file
+        for fname in os.listdir(models_dir):
+            if fname.endswith(".gguf"):
+                return os.path.join(models_dir, fname)
+
+        return None
+
+    def _find_llama_cli(self) -> Optional[str]:
+        candidates = [
+            os.environ.get("ARCFLARE_LLAMA_CLI", ""),
+            "/usr/local/bin/llama-cli",
+            "/usr/local/bin/llama",
+            "/tmp/llama-cli",
+            "/app/llama-cli",
+            "/app/llama",
+        ]
+        for path in candidates:
+            if path and os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return None
 
     async def run(
         self,
@@ -45,46 +74,102 @@ class InferencePipeline:
 
         nodes = discovery_service.get_nodes() if discovery_service else []
         if not nodes:
-            logger.info("No cluster nodes available — using local inference stub")
-            async for token in self._local_inference_stub(prompt, max_tokens):
+            logger.info("No cluster nodes available — using local inference")
+            async for token in self._local_inference(prompt, max_tokens, temperature):
                 yield token
             return
 
-        # TODO: Phase 2 — actual distributed pipeline
-        # 1. Get partition plan
-        # 2. Load shards on nodes
-        # 3. Send prompt to first node
-        # 4. Stream results back through chain
-
-        logger.info(f"Running inference on {len(nodes)} nodes (stub)")
-        async for token in self._local_inference_stub(prompt, max_tokens):
+        logger.info(f"Running inference on {len(nodes)} nodes (Phase 2 — using local fallback)")
+        async for token in self._local_inference(prompt, max_tokens, temperature):
             yield token
 
-    async def _local_inference_stub(
+    async def _local_inference(
         self,
         prompt: str,
         max_tokens: int = 1024,
+        temperature: float = 0.7,
     ) -> AsyncGenerator[str, None]:
-        """Stub for when no nodes are available."""
-        response = (
-            f"[ArcFlare local mode]\n"
-            f"Received prompt ({len(prompt)} chars). "
-            f"Connect cluster nodes for full inference.\n"
-            f"Requested max_tokens={max_tokens}\n"
-        )
-        # Simulate streaming by yielding characters
-        for char in response:
-            yield char
-            await asyncio.sleep(0.01)
+        """Run inference using local llama-cli subprocess."""
+        model_path = self._find_model("default")
+        llama_cli = self._find_llama_cli()
+
+        if not model_path or not llama_cli:
+            logger.warning(f"Model ({model_path}) or llama-cli ({llama_cli}) not found — using stub")
+            response = (
+                f"[ArcFlare local mode]\n"
+                f"Received prompt ({len(prompt)} chars). "
+                f"Install llama-cli and a GGUF model for real inference.\n"
+            )
+            for char in response:
+                yield char
+                await asyncio.sleep(0.01)
+            return
+
+        logger.info(f"Running llama-cli with model: {model_path}")
+        cmd = [
+            llama_cli,
+            "-m", model_path,
+            "-p", prompt,
+            "-n", str(max_tokens),
+            "--no-display-prompt",
+            "--single-turn",
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout_data, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=600
+            )
+
+            output = stdout_data.decode("utf-8", errors="replace")
+            # Extract the model response: take everything between "> prompt" and "[Prompt:" status
+            lines = output.split("\n")
+            capturing = False
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Start capturing when we see the "> prompt" line
+                if not capturing and stripped.startswith("> "):
+                    capturing = True
+                    continue
+                # Stop at status line
+                if capturing and stripped.startswith("["):
+                    break
+                # Skip help text between prompt and response
+                if capturing and stripped.startswith("/"):
+                    continue
+                # Capture response lines, stripping spinner artifacts
+                if capturing and stripped:
+                    # Strip spinner character + backspace artifacts
+                    if any(stripped.startswith(c) for c in ("|", "/", "-", "\\", "=")):
+                        stripped = stripped.lstrip("|/-\\=").lstrip("\b \b").strip()
+                    clean = stripped.replace("\b", "").replace("\r", "").strip()
+                    if clean and not clean.startswith(">") and not clean.startswith("Exiting"):
+                        yield clean + "\n"
+                        await asyncio.sleep(0.01)
+
+        except asyncio.TimeoutError:
+            logger.error("llama-cli timed out")
+            yield "\n[Inference timed out]\n"
+        except FileNotFoundError:
+            logger.error("llama-cli binary not found")
+            yield "\n[llama-cli not found]\n"
+        except Exception as e:
+            logger.error(f"Inference error: {e}")
+            yield f"\n[Error: {e}]\n"
 
     async def _distribute_prompt(self, prompt: str, nodes: list) -> list:
         """Tokenize and distribute prompt across nodes."""
-        # Phase 2: implement actual tokenization + distribution
         return []
 
     async def _collect_logits(self, nodes: list) -> list:
         """Collect logits from the final node in pipeline."""
-        # Phase 2: implement logit collection
         return []
 
 

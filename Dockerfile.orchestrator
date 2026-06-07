@@ -5,8 +5,21 @@ WORKDIR /app
 COPY orchestrator/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+ENV PYTHONPATH=/app
+
 COPY orchestrator/src/ /app
+
+# Copy llama-cli for local inference fallback
+COPY tools/llama-cli /usr/local/bin/llama-cli
+RUN chmod +x /usr/local/bin/llama-cli
+
+# Copy model for inference
+RUN mkdir -p /models
+COPY models/qwen2.5-0.5b-instruct-q4_k_m.gguf /models/
+
+ENV ARCFLARE_LLAMA_CLI=/usr/local/bin/llama-cli
+ENV ARCFLARE_MODELS_DIR=/models
 
 EXPOSE 8000
 
-CMD ["uvicorn", "arcflare.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "arcflare.main:app", "--host", "0.0.0.0", "--port", "8000"]

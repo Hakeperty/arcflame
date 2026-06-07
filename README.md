@@ -1,148 +1,296 @@
 # ArcFlare
 
-**Distributed LLM inference for old/scrap hardware.**
+**Distributed LLM inference across scrap hardware.** Chain old laptops, Raspberry Pis, and desktops into a single AI cluster. ArcFlare splits a model across your devices so you can run models larger than any single machine can handle.
 
-Turn old laptops (ThinkPads, Dells, Optiplexes), Raspberry Pis, and other scrap devices into a unified cluster for running large language models.
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────┐
+│                     Your LAN                          │
+│                                                      │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐       │
+│  │ Orchestr │    │  Node A  │    │  Node B  │       │
+│  │  Python   │◄──►│  Rust    │◄──►│  Rust    │       │
+│  │  API +    │    │ gRPC    │    │ gRPC    │       │
+│  │  Control  │    │ Server   │    │ Server   │       │
+│  └────┬─────┘    └──────────┘    └──────────┘       │
+│       │                                               │
+│       └── Your apps (curl, OpenWebUI, Claude Code)    │
+└─────────────────────────────────────────────────────┘
+```
+
+1. **Each machine** runs a lightweight `node-agent` (Rust) or orchestrator (Python)
+2. **Nodes auto-discover** each other via UDP broadcast — no config needed
+3. **Orchestrator** coordinates inference, splitting model layers across nodes
+4. **You interact** via OpenAI-compatible API at `http://<orchestrator>:8000`
+
+## Installation (Step by Step)
+
+### Step 1 — Clone the repo
+
+```bash
+git clone https://github.com/Hakeperty/arcflare.git
+cd arcflare
+```
+
+### Step 2 — Install prerequisites
+
+**On every machine** (orchestrator + all nodes):
+
+```bash
+# Linux (Ubuntu/Debian)
+sudo apt install cmake build-essential clang libclang-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+source "$HOME/.cargo/env"
+```
+
+**MacOS:**
+
+```bash
+brew install cmake llvm
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+source "$HOME/.cargo/env"
+```
+
+**Raspberry Pi (ARM):**
+
+```bash
+sudo apt install cmake build-essential clang libclang-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+source "$HOME/.cargo/env"
+```
+
+### Step 3 — Install Python dependencies (orchestrator machine only)
+
+```bash
+pip install -r orchestrator/requirements.txt
+```
+
+### Step 4 — Build the node agent (every machine)
+
+```bash
+cargo build --release -p node-agent
+sudo cp target/release/node-agent /usr/local/bin/arcflare-node
+```
+
+### Step 5 — Download a model (orchestrator machine)
+
+ArcFlare uses GGUF format models (see [llama.cpp](https://github.com/ggml-org/llama.cpp)):
+
+```bash
+mkdir -p models
+
+# Small model for testing (469MB)
+pip install huggingface-hub
+python3 -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id='Qwen/Qwen2.5-0.5B-Instruct-GGUF',
+    filename='qwen2.5-0.5b-instruct-q4_k_m.gguf',
+    local_dir='models',
+)
+"
+```
+
+### Step 6 — Install `llama-cli` (orchestrator machine)
+
+```bash
+curl -sL "https://github.com/ggml-org/llama.cpp/releases/download/b9547/llama-b9547-bin-ubuntu-x64.tar.gz" \
+  | tar -xz --strip=1 -C /usr/local/bin '*/llama-cli'
+llama-cli --version  # verify
+```
+
+### Step 7 — Start the orchestrator (pick one machine)
+
+```bash
+cd orchestrator/src
+ARCFLARE_LLAMA_CLI=/usr/local/bin/llama-cli \
+ARCFLARE_MODELS_DIR=/home/$USER/arcflare/models \
+uvicorn arcflare.main:app --host 0.0.0.0 --port 8000
+```
+
+### Step 8 — Join nodes to the cluster
+
+**On each worker machine:**
+
+```bash
+arcflare-node --orchestrator-host <orchestrator-ip>
+```
+
+**On the orchestrator machine itself** (if also running a node):
+
+```bash
+arcflare-node --orchestrator-host 127.0.0.1 --grpc-port 9001 --name orchest-node
+```
+
+### Step 9 — Verify the cluster
+
+```bash
+curl http://<orchestrator-ip>:8000/api/cluster/status
+```
+
+Expected output — you should see all machines listed under `nodes`.
+
+### Step 10 — Chat!
+
+```bash
+curl -X POST http://<orchestrator-ip>:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arcflare/default","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+---
+
+### Alternative: Docker (single-machine test)
+
+```bash
+docker compose up -d
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arcflare/default","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### Alternative: Local dev cluster (all on one machine)
+
+```bash
+# Terminal 1 — orchestrator
+cd orchestrator/src
+ARCFLARE_LLAMA_CLI=/usr/local/bin/llama-cli \
+ARCFLARE_MODELS_DIR=/home/$USER/arcflare/models \
+uvicorn arcflare.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 2 — node alpha
+arcflare-node --orchestrator-host 127.0.0.1 --grpc-port 9001 --name alpha
+
+# Terminal 3 — node beta
+arcflare-node --orchestrator-host 127.0.0.1 --grpc-port 9002 --name beta
+```
+
+## API
+
+ArcFlare is **OpenAI API compatible**. Use any OpenAI client/tool:
+
+```bash
+# List models
+curl http://localhost:8000/v1/models
+
+# Chat
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arcflare/default","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Completions
+curl -X POST http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arcflare/default","prompt":"Once upon a time","max_tokens":100}'
+```
+
+### Management API
+
+```bash
+# Cluster status
+curl http://localhost:8000/api/cluster/status
+
+# List registered nodes
+curl http://localhost:8000/api/nodes
+
+# Node details
+curl http://localhost:8000/api/nodes/<node-id>
+```
+
+### OpenAI-compatible integration
+
+ArcFlare works as a drop-in OpenAI backend for any tool.
+
+## Auto-Discovery
+
+Nodes on the same LAN automatically find each other:
+
+1. Each node broadcasts a UDP heartbeat on port **5678** every 5 seconds
+2. The orchestrator listens and registers new nodes automatically
+3. Nodes also register via HTTP POST to `http://<orchestrator>:8000/api/nodes/register`
+4. No manual IP configuration needed — just run the agent
+
+Discovery message includes:
+- Node ID (machine UID + port)
+- Node name
+- gRPC port
+- OS and version
+
+## Hardware Detection
+
+Each node agent reports its hardware to the orchestrator:
+
+- **CPU**: cores, architecture, frequency
+- **RAM**: total and available
+- **GPU**: vendor, model, VRAM
+- **Drivers**: NVIDIA/CUDA status, Vulkan support
+- **Benchmark**: CPU performance score
+
+The orchestrator uses this data to decide how to split model layers across nodes.
+
+## Overclocking & Tuning
+
+Built-in performance optimization for scrap hardware:
+
+| Mode | What it does |
+|---|---|
+| **Safe** (default) | Governor tweaks, hugepages, IO scheduler |
+| **Aggressive** | Overclock CPU, undervolt GPU, max fans |
+| **Driver audit** | Checks for outdated GPU drivers |
+| **System tuning** | Kernel params, swap, NUMA balancing |
+
+```bash
+# Via API
+curl -X POST http://localhost:8000/api/nodes/<id>/tune
+curl -X POST http://localhost:8000/api/nodes/<id>/benchmark
+```
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────┐
-│           Orchestrator (Python)         │
-│  Manages cluster, provides OpenAI API  │
-└──────────────┬─────────────────────────┘
-               │ gRPC control
-     ┌─────────┼─────────┐
-     │         │         │
-┌────▼────┐ ┌──▼──┐ ┌───▼────┐
-│ Node    │ │Node │ │ Node   │
-│ Agent   │ │Agent│ │ Agent  │
-│ (Rust)  │ │     │ │        │
-│         │ │     │ │        │
-│ • HW    │ │ ... │ │ ...    │
-│ • OC    │ │     │ │        │
-│ • Inf   │ │     │ │        │
-└─────────┘ └─────┘ └────────┘
+arcflare/
+├── node-agent/          # Rust — runs on each node
+│   ├── src/
+│   │   ├── hardware/    # CPU/GPU/RAM detection
+│   │   ├── overclocking/# Safe + aggressive tuning
+│   │   ├── drivers/     # GPU driver audit
+│   │   ├── tuning/      # System optimization
+│   │   ├── inference/   # Model loading + forward pass
+│   │   └── network/     # gRPC server + UDP discovery
+│   └── Cargo.toml
+├── orchestrator/        # Python — cluster brain
+│   ├── src/arcflare/
+│   │   ├── api/         # OpenAI-compatible + management API
+│   │   ├── cluster/     # Discovery, partitioning
+│   │   ├── inference/   # Pipeline coordinator
+│   │   └── models/      # Download + shard management
+│   └── pyproject.toml
+├── proto/               # gRPC service definitions
+└── tools/
+    └── gguf-splitter/   # GGUF analysis + partition planner
 ```
 
-- **Orchestrator** (Python/FastAPI): Controls the cluster, provides OpenAI-compatible API
-- **Node Agent** (Rust): Runs on each device — optimizes hardware, runs inference via llama.cpp
-
-## Features
-
-- **Distributed inference**: Split large models (30B-236B+) across multiple low-RAM devices
-- **Pipeline parallelism**: Each node processes a subset of layers, passes hidden states to the next
-- **GGUF sharding**: Split models into per-layer shards for efficient distribution
-- **Auto-overclocking**: Safe mode (governor, hugepages) + Aggressive mode (undervolt, TDP, GPU OC)
-- **Driver auditing**: Check NVIDIA/AMD/Intel driver status, get upgrade recommendations
-- **System tuning**: Swappiness, hugepages, I/O scheduler, NUMA balancing, THP
-- **CLI integration**: OpenAI-compatible API works with OpenCode, Claude Code, Qwen Code
-- **P2P model distribution**: Nodes share model shards between each other
-
-## Quick Start
-
-### Prerequisites
-- Rust toolchain (for node agent)
-- Python 3.11+ (for orchestrator)
-
-### Build
+## Development
 
 ```bash
-# Build the node agent
+# Build everything
 cargo build --release -p node-agent
 
-# Build the GGUF splitter
-cargo build --release -p gguf-splitter
+# Run tests
+python3 -m pytest orchestrator/tests/
+cargo test -p node-agent
 
-# Install Python dependencies
-cd orchestrator && pip install -r requirements.txt
-```
+# Local multi-node test
+bash tools/scripts/test-cluster.sh
 
-### Run (single machine development mode)
-
-```bash
-# Terminal 1: Start orchestrator
-cd orchestrator && uvicorn arcflare.main:app --reload --port 8000
-
-# Terminal 2: Start simulated nodes
-./target/release/node-agent --grpc-port 9001 --name node-alpha
-./target/release/node-agent --grpc-port 9002 --name node-beta
-./target/release/node-agent --grpc-port 9003 --name node-gamma
-```
-
-### Deploy to real hardware
-
-```bash
-# Deploy node agent to a remote machine
-./tools/scripts/deploy-node.sh user@old-laptop.local
-```
-
-### Use with CLI tools
-
-```bash
-# OpenCode
-OPENCODE_CONFIG_CONTENT='{"provider":{"id":"arcflare","model":"arcflare/default","urls":{"base_url":"http://localhost:8000/v1"}}}' opencode
-
-# Claude Code
-ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=arcflare-dev-key claude
-
-# Qwen Code / any OpenAI-compatible
-OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=arcflare-dev-key qwen
-```
-
-## Model Support
-
-Split any GGUF model across your cluster:
-
-```bash
-# Analyze a model and create split plan
-gguf-splitter --model qwen2.5-32b-q4.gguf --layers-per-shard 10
-
-# Load a model through the orchestrator
-curl -X POST http://localhost:8000/api/models/load \
-  -H "Content-Type: application/json" \
-  -d '{"model": "qwen2.5-32b", "path": "/models/qwen2.5-32b-q4.gguf"}'
-```
-
-## Target Hardware
-
-| Device | Min RAM | Expected Performance |
-|--------|---------|-------------------|
-| ThinkPad X230 (i5, 8GB) | 8 GB | 1-3 layers of 32B |
-| Dell Optiplex (i7, 16GB) | 16 GB | 3-8 layers of 32B |
-| Raspberry Pi 4 (4GB) | 4 GB | 1-2 layers (slow) |
-| Old phone (Linux/Android) | 4 GB | 1 layer (experimental) |
-| Any x86 Linux machine | 2 GB | Can contribute |
-
-## Project Structure
-
-```
-arcflare/
-├── proto/                    # gRPC protocol definition
-├── orchestrator/             # Python orchestrator
-│   └── src/arcflare/
-│       ├── api/              # OpenAI-compatible + management API
-│       ├── cluster/          # Discovery, topology, partitioning
-│       ├── models/           # Model download, sharding
-│       ├── inference/        # Pipeline coordination
-│       └── cli/              # OpenCode/Claude/Qwen adapters
-├── node-agent/               # Rust node agent
-│   └── src/
-│       ├── hardware/         # CPU/GPU/RAM detection
-│       ├── overclocking/     # Safe + aggressive tuning
-│       ├── drivers/          # Driver auditing
-│       ├── tuning/           # Kernel parameters
-│       ├── inference/        # llama.cpp integration
-│       └── network/          # gRPC + discovery
-├── tools/
-│   ├── gguf-splitter/        # GGUF sharding tool
-│   └── scripts/              # Dev & deploy helpers
-└── docker-compose.yml        # Multi-node dev env
+# Docker multi-node test
+bash tools/scripts/test-docker.sh
 ```
 
 ## Roadmap
 
-### Phase 1 ✅ (Current)
+### Phase 1 ✅ (Done)
 - [x] Project scaffolding
 - [x] gRPC protocol definition
 - [x] Node agent: hardware detection, gRPC server
@@ -154,14 +302,15 @@ arcflare/
 - [x] System tuning
 - [x] OpenAI-compatible API
 - [x] CLI integration adapters
+- [x] Docker multi-node cluster
+- [x] Real inference via llama-cli
 
 ### Phase 2 🔜
-- [ ] Full distributed inference pipeline
+- [ ] Full distributed inference pipeline (in progress)
 - [ ] P2P shard transfer (libp2p)
 - [ ] Custom layer partitioning engine
 - [ ] llama-cpp-4 inference integration
 - [ ] KV cache optimization
-### Phase 2 (maybes)
 - [ ] Quantizing and training opportunity
 
 ### Phase 3 🔜
@@ -174,4 +323,3 @@ arcflare/
 
 MIT
 
-arcflame Built for revolution

@@ -138,8 +138,9 @@ impl NodeAgent for ArcFlareNodeService {
         #[cfg(feature = "inference")]
         {
             let config = request.into_inner();
-            crate::inference::load_shard(config).await
-                .map_err(|e| Status::internal(format!("Failed to load shard: {}", e)))
+            let status = crate::inference::load_shard(config).await
+                .map_err(|e| Status::internal(format!("Failed to load shard: {}", e)))?;
+            Ok(Response::new(status))
         }
 
         #[cfg(not(feature = "inference"))]
@@ -158,8 +159,9 @@ impl NodeAgent for ArcFlareNodeService {
         #[cfg(feature = "inference")]
         {
             let req = request.into_inner();
-            crate::inference::forward(req).await
-                .map_err(|e| Status::internal(format!("Forward pass failed: {}", e)))
+            let resp = crate::inference::forward(req).await
+                .map_err(|e| Status::internal(format!("Forward pass failed: {}", e)))?;
+            Ok(Response::new(resp))
         }
 
         #[cfg(not(feature = "inference"))]

@@ -18,7 +18,9 @@ services:
       dockerfile: Dockerfile.node
     environment:
       - ARCFLARE_NODE_NAME=alpha
-      - ARCFLARE_ORCHESTRATOR=orchestrator:8000
+      - ARCFLARE_GRPC_PORT=9001
+      - ARCFLARE_ORCHESTRATOR_HOST=orchestrator
+      - ARCFLARE_ORCHESTRATOR_PORT=8000
     volumes:
       - ./models:/models
     depends_on: [orchestrator]
@@ -29,7 +31,9 @@ services:
       dockerfile: Dockerfile.node
     environment:
       - ARCFLARE_NODE_NAME=beta
-      - ARCFLARE_ORCHESTRATOR=orchestrator:8000
+      - ARCFLARE_GRPC_PORT=9002
+      - ARCFLARE_ORCHESTRATOR_HOST=orchestrator
+      - ARCFLARE_ORCHESTRATOR_PORT=8000
     volumes:
       - ./models:/models
     depends_on: [orchestrator]
