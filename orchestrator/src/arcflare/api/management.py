@@ -24,6 +24,8 @@ class RegisterRequest(BaseModel):
     rpc_port: int = 0
     version: str = "0.0.0"
     os: str = "unknown"
+    # compact hardware summary, e.g. {"cpu_cores": 8, "ram_bytes": 167..., "gpu_count": 1}
+    hardware: dict | None = None
 
 
 @router.post("/nodes/register")
@@ -35,7 +37,14 @@ async def register_node(req: RegisterRequest, request: Request):
     if discovery_service is None:
         raise HTTPException(503, "Discovery service not ready")
 
+    # basic validation — reject empty identifiers and bad ports
+    if not req.node_id.strip() or not req.name.strip():
+        raise HTTPException(422, "node_id and name must be non-empty")
+    if not (0 < req.grpc_port < 65536) or not (0 <= req.rpc_port < 65536):
+        raise HTTPException(422, "ports out of range")
+
     client_ip = request.client.host if request.client else "127.0.0.1"
+    existing = discovery_service.nodes.get(req.node_id)
     node_info = NodeInfo(
         node_id=req.node_id,
         node_name=req.name,
@@ -46,9 +55,10 @@ async def register_node(req: RegisterRequest, request: Request):
         ip_address=client_ip,
         last_seen=time.time(),
         status="alive",
+        hardware=req.hardware if req.hardware is not None else (existing.hardware if existing else None),
     )
     discovery_service.nodes[req.node_id] = node_info
-    logger.info(f"Node registered via HTTP: {req.name} ({req.node_id})"
+    logger.info(f"Node {'re-' if existing else ''}registered via HTTP: {req.name} ({req.node_id})"
                 + (f" rpc={req.rpc_port}" if req.rpc_port else ""))
     return {"status": "registered", "node_id": req.node_id}
 
@@ -79,8 +89,9 @@ async def cluster_status():
         return {"status": "starting", "nodes": 0}
 
     nodes = discovery_service.get_nodes()
-    total_ram = sum(n.get("memory", {}).get("total_bytes", 0) for n in nodes)
-    total_gpus = sum(1 for n in nodes if n.get("gpus"))
+    # hardware is the compact summary supplied at registration (may be absent)
+    total_ram = sum((n.get("hardware") or {}).get("ram_bytes", 0) for n in nodes)
+    total_gpus = sum((n.get("hardware") or {}).get("gpu_count", 0) for n in nodes)
     rpc_endpoints = discovery_service.get_rpc_endpoints()
 
     return {

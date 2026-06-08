@@ -90,6 +90,10 @@ class DiscoveryService:
                     version=version,
                     os=os_name,
                     ip_address=addr[0],
+                    # stamp last_seen on first sight so the node is eligible for
+                    # pruning if it later goes silent (default 0.0 would never prune)
+                    last_seen=time.time(),
+                    status="alive",
                 )
             else:
                 self.nodes[node_id].last_seen = time.time()
