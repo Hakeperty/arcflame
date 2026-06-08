@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down ArcFlare orchestrator...")
     if discovery_service:
         discovery_service.stop()
+    # stop the persistent llama-server child so it isn't orphaned on restart
+    try:
+        from .inference.pipeline import _pipeline
+        if _pipeline is not None:
+            await _pipeline.server.stop()
+    except Exception as e:
+        logger.debug(f"llama-server stop on shutdown: {e}")
     logger.info("Shutdown complete")
 
 
