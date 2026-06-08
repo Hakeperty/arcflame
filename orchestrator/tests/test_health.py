@@ -41,6 +41,27 @@ def test_crashed_node_removed_after_threshold():
     assert "n1" not in svc.nodes  # crashed node pruned
 
 
+def test_busy_node_not_dropped_on_timeout(monkeypatch):
+    # rpc-server has backlog 1; a busy node times out (probe -> None) but is alive.
+    # It must NOT be removed and must stay fresh.
+    svc = DiscoveryService()
+    svc.nodes["n1"] = NodeInfo("n1", "n1", 9001, "1", "linux",
+                               rpc_port=10001, ip_address="127.0.0.1",
+                               consecutive_failures=2, last_seen=0.0)
+
+    async def fake_probe(ip, port, timeout=2.0):
+        return None  # inconclusive / busy
+    monkeypatch.setattr(svc, "_probe", fake_probe)
+
+    async def run():
+        for _ in range(5):
+            await svc.check_all_nodes()
+    asyncio.run(run())
+    assert "n1" in svc.nodes                       # survived
+    assert svc.nodes["n1"].consecutive_failures == 0
+    assert svc.nodes["n1"].last_seen > 0           # refreshed
+
+
 def test_healthy_node_survives_and_resets_failures():
     svc = DiscoveryService()
     sock, port = _free_listening_port()

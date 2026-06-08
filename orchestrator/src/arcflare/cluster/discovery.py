@@ -78,8 +78,15 @@ class DiscoveryService:
 
     # ─── active health monitoring (Phase 3 crash recovery) ───
 
-    async def _probe(self, ip: str, port: int, timeout: float = 2.0) -> bool:
-        """TCP-connect probe to (ip, port); True if reachable."""
+    async def _probe(self, ip: str, port: int, timeout: float = 2.0) -> Optional[bool]:
+        """TCP-connect probe to (ip, port).
+
+        Returns True (reachable), False (connection refused — the port is
+        actively closed, i.e. the server is down), or None (inconclusive:
+        timeout/other). rpc-server listens with a backlog of 1, so when
+        llama-server holds its connection a probe can time out even though the
+        node is alive — that must NOT count as a failure.
+        """
         if not ip or not port:
             return False
         try:
@@ -91,25 +98,29 @@ class DiscoveryService:
             except Exception:
                 pass
             return True
-        except (OSError, asyncio.TimeoutError):
+        except ConnectionRefusedError:
             return False
+        except (asyncio.TimeoutError, OSError):
+            return None
 
     async def check_all_nodes(self) -> dict:
-        """Probe every node once; update liveness, drop nodes that fail
-        HEALTH_FAIL_THRESHOLD times in a row. Returns {node_id: alive}."""
+        """Probe every node once; update liveness, drop nodes whose port is
+        actively closed HEALTH_FAIL_THRESHOLD times in a row. Returns
+        {node_id: probe_result}."""
         results = {}
         for node_id, node in list(self.nodes.items()):
             # prefer the rpc-server port (the thing inference actually uses)
             port = node.rpc_port or node.grpc_port
             alive = await self._probe(node.ip_address, port)
             results[node_id] = alive
-            if alive:
+            if alive is True:
                 if node.consecutive_failures:
                     logger.info(f"Node {node.node_name} healthy again")
                 node.consecutive_failures = 0
                 node.last_seen = time.time()
                 node.status = "alive"
-            else:
+            elif alive is False:
+                # port actively refused → server is down
                 node.consecutive_failures += 1
                 node.status = "degraded"
                 if node.consecutive_failures >= HEALTH_FAIL_THRESHOLD:
@@ -117,6 +128,13 @@ class DiscoveryService:
                         f"Node {node.node_name} ({node_id}) failed "
                         f"{node.consecutive_failures} probes — removing")
                     del self.nodes[node_id]
+            else:
+                # None: inconclusive (timeout/busy). A crashed server refuses the
+                # connection (handled above); a timeout usually means the rpc
+                # backlog is busy serving — assume alive and refresh last_seen so
+                # the heartbeat pruner doesn't drop a working node.
+                node.consecutive_failures = 0
+                node.last_seen = time.time()
         return results
 
     async def health_loop(self, interval: float = HEALTH_INTERVAL):
