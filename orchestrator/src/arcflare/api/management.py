@@ -92,11 +92,13 @@ async def cluster_status():
     # hardware is the compact summary supplied at registration (may be absent)
     total_ram = sum((n.get("hardware") or {}).get("ram_bytes", 0) for n in nodes)
     total_gpus = sum((n.get("hardware") or {}).get("gpu_count", 0) for n in nodes)
+    degraded = sum(1 for n in nodes if n.get("status") == "degraded")
     rpc_endpoints = discovery_service.get_rpc_endpoints()
 
     return {
         "status": "running",
         "nodes": len(nodes),
+        "degraded": degraded,
         "total_ram_gb": total_ram / (1024**3),
         "total_gpus": total_gpus,
         "models": discovery_service.get_available_models(),

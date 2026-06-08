@@ -22,12 +22,13 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting ArcFlare orchestrator...")
     discovery_service = DiscoveryService()
-    # keep a strong reference — a bare create_task() can be garbage-collected
-    # mid-flight, silently cancelling discovery and swallowing its errors
-    task = asyncio.create_task(discovery_service.start())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    logger.info("Discovery service started on UDP port 5678")
+    # keep strong references — a bare create_task() can be garbage-collected
+    # mid-flight, silently cancelling the task and swallowing its errors
+    for coro in (discovery_service.start(), discovery_service.health_loop()):
+        task = asyncio.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    logger.info("Discovery + health monitor started")
 
     yield
 

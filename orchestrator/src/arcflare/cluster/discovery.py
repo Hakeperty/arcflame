@@ -13,6 +13,10 @@ BROADCAST_ADDR = "255.255.255.255"
 HEARTBEAT_TIMEOUT = 15  # seconds
 
 
+HEALTH_INTERVAL = 10        # seconds between active probes
+HEALTH_FAIL_THRESHOLD = 3   # consecutive failed probes before a node is dropped
+
+
 @dataclass
 class NodeInfo:
     node_id: str
@@ -25,6 +29,7 @@ class NodeInfo:
     status: str = "discovered"
     ip_address: str = ""
     rpc_port: int = 0  # 0 = rpc-server not running on this node
+    consecutive_failures: int = 0  # failed health probes in a row
 
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
@@ -45,7 +50,9 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
 class DiscoveryService:
     def __init__(self):
         self.nodes: Dict[str, NodeInfo] = {}
-        self._running = False
+        # True from construction so the health_loop task doesn't exit if it is
+        # scheduled before start() runs (create_task ordering isn't guaranteed)
+        self._running = True
         self._transport: Optional[asyncio.DatagramTransport] = None
 
     async def start(self):
@@ -68,6 +75,59 @@ class DiscoveryService:
         self._running = False
         if self._transport:
             self._transport.close()
+
+    # ─── active health monitoring (Phase 3 crash recovery) ───
+
+    async def _probe(self, ip: str, port: int, timeout: float = 2.0) -> bool:
+        """TCP-connect probe to (ip, port); True if reachable."""
+        if not ip or not port:
+            return False
+        try:
+            fut = asyncio.open_connection(ip, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except (OSError, asyncio.TimeoutError):
+            return False
+
+    async def check_all_nodes(self) -> dict:
+        """Probe every node once; update liveness, drop nodes that fail
+        HEALTH_FAIL_THRESHOLD times in a row. Returns {node_id: alive}."""
+        results = {}
+        for node_id, node in list(self.nodes.items()):
+            # prefer the rpc-server port (the thing inference actually uses)
+            port = node.rpc_port or node.grpc_port
+            alive = await self._probe(node.ip_address, port)
+            results[node_id] = alive
+            if alive:
+                if node.consecutive_failures:
+                    logger.info(f"Node {node.node_name} healthy again")
+                node.consecutive_failures = 0
+                node.last_seen = time.time()
+                node.status = "alive"
+            else:
+                node.consecutive_failures += 1
+                node.status = "degraded"
+                if node.consecutive_failures >= HEALTH_FAIL_THRESHOLD:
+                    logger.warning(
+                        f"Node {node.node_name} ({node_id}) failed "
+                        f"{node.consecutive_failures} probes — removing")
+                    del self.nodes[node_id]
+        return results
+
+    async def health_loop(self, interval: float = HEALTH_INTERVAL):
+        """Background task: periodically probe nodes for crash detection."""
+        logger.info(f"Health monitor started (every {interval}s)")
+        while self._running:
+            try:
+                await self.check_all_nodes()
+            except Exception as e:
+                logger.debug(f"health check error: {e}")
+            await asyncio.sleep(interval)
 
     def _handle_discovery(self, data: bytes, addr: tuple):
         try:
