@@ -252,6 +252,31 @@ The orchestrator picks the inference mode in this order:
 
 The active mode is reported in `/api/cluster/status` as `pipeline_mode`.
 
+### Persistent model server
+
+By default the orchestrator runs a single long-lived `llama-server` rather than
+spawning a fresh `llama-cli` per request. The model is loaded **once** (and, in
+RPC mode, its tensors are shipped to the nodes once); subsequent requests just
+stream tokens over its local HTTP API. This cut warm-request latency from ~23s
+(reload every time) to ~1.4s in local testing. Set `ARCFLARE_LLAMA_SERVER` to
+the `llama-server` binary (or it's auto-discovered next to `llama-cli`); the
+server restarts automatically when the model or the set of RPC nodes changes.
+
+## Web Dashboard (Phase 3)
+
+Open `http://<orchestrator>:8000/dashboard` for a live view of the cluster:
+status, total RAM/GPUs, `pipeline_mode`, the node table (with RPC endpoints),
+and an inference tester. Pure HTML/JS, no build step, refreshes every 3s.
+
+## Health Monitoring & Crash Recovery (Phase 3)
+
+The orchestrator actively probes each node every 10s. A node whose port is
+refused for 3 consecutive checks is dropped; a busy-but-alive node (its probe
+times out while serving) is kept. When a node disappears, the persistent
+`llama-server` is automatically reconfigured to use the remaining nodes — a
+crashed worker degrades the cluster instead of breaking it. `/api/cluster/status`
+reports a `degraded` count.
+
 ## Auto-Discovery
 
 Nodes on the same LAN automatically find each other:
@@ -328,8 +353,9 @@ arcflare/
 cargo build --release -p node-agent
 
 # Run tests
-python3 -m pytest orchestrator/tests/
-cargo test -p node-agent
+pip install -r orchestrator/requirements-dev.txt
+python3 -m pytest orchestrator/tests/      # 15 tests, no GPU/model needed
+cargo build -p node-agent                  # node-agent compiles (default features)
 
 # Local multi-node test
 bash tools/scripts/test-cluster.sh
@@ -355,8 +381,9 @@ bash tools/scripts/test-docker.sh
 - [x] Docker multi-node cluster
 - [x] Real inference via llama-cli
 
-### Phase 2 🔜
+### Phase 2 ✅ (mostly done)
 - [x] Full distributed inference pipeline — llama.cpp RPC backend
+- [x] Persistent `llama-server` (model loaded once; ~23s → ~1.4s warm requests)
 - [ ] P2P shard transfer (libp2p)
 - [ ] Custom layer partitioning engine
 - [ ] llama-cpp-4 inference integration
@@ -364,9 +391,10 @@ bash tools/scripts/test-docker.sh
 - [ ] Quantizing and training opportunity
 
 ### Phase 3 🔜
-- [ ] Web dashboard
+- [x] Web dashboard (`/dashboard`)
+- [x] Crash recovery — active health monitoring, auto-drop dead nodes,
+      llama-server reconfigures around survivors
 - [ ] Windows node agent support
-- [ ] Crash recovery
 - [ ] Live re-partitioning
 
 ## License
