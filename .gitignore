@@ -44,6 +44,8 @@ shards/
 tools/scripts/test-cluster.sh
 tools/scripts/test-docker.sh
 tools/llama-cli*
+tools/llama-rpc-server*
+tools/llama-bin/
 
 # Test results
 tests/results/
