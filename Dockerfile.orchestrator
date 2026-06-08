@@ -1,23 +1,35 @@
+# syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
+ARG LLAMA_RELEASE=b9558
 WORKDIR /app
+
+# libgomp1 for the llama.cpp CPU backend; curl to fetch the llama.cpp release
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY orchestrator/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 ENV PYTHONPATH=/app
-
 COPY orchestrator/src/ /app
 
-# Copy llama-cli for local inference fallback
-COPY tools/llama-cli /usr/local/bin/llama-cli
-RUN chmod +x /usr/local/bin/llama-cli
+# llama.cpp release for the local-inference fallback + libs it links against.
+RUN mkdir -p /opt/llama \
+    && curl -fsSL "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/llama-${LLAMA_RELEASE}-bin-ubuntu-x64.tar.gz" \
+       | tar -xz -C /opt/llama \
+    && BIN_DIR="$(dirname "$(find /opt/llama -type f -name llama-cli | head -1)")" \
+    && ln -s "$BIN_DIR" /opt/llama/bin \
+    && ln -sf /opt/llama/bin/llama-cli   /usr/local/bin/llama-cli \
+    && ln -sf /opt/llama/bin/llama-server /usr/local/bin/llama-server
+ENV LD_LIBRARY_PATH=/opt/llama/bin
 
-# Copy model for inference
+# The model is provided at runtime via the ./models volume mount (see docker-compose.yml),
+# so it is NOT baked into the image. Mount a .gguf into /models.
 RUN mkdir -p /models
-COPY models/qwen2.5-0.5b-instruct-q4_k_m.gguf /models/
-
 ENV ARCFLARE_LLAMA_CLI=/usr/local/bin/llama-cli
+ENV ARCFLARE_LLAMA_SERVER=/usr/local/bin/llama-server
 ENV ARCFLARE_MODELS_DIR=/models
 
 EXPOSE 8000

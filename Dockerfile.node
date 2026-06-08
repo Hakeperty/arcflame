@@ -1,15 +1,35 @@
-FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# syntax=docker/dockerfile:1
+# ---- builder: compile the Rust node-agent ----
+FROM rust:1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p node-agent
 
-COPY target/release/node-agent /usr/local/bin/arcflare-node
+# ---- runtime ----
+FROM ubuntu:24.04
+ARG LLAMA_RELEASE=b9558
+# ca-certificates for HTTPS, libgomp1 for the llama.cpp OpenMP CPU backend, curl to fetch the release
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libgomp1 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# llama.cpp release ships rpc-server + llama-cli + the libggml*.so it links against.
+# Extract wherever the archive nests them, then expose a stable /opt/llama/bin.
+RUN mkdir -p /opt/llama \
+    && curl -fsSL "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/llama-${LLAMA_RELEASE}-bin-ubuntu-x64.tar.gz" \
+       | tar -xz -C /opt/llama \
+    && BIN_DIR="$(dirname "$(find /opt/llama -type f -name rpc-server | head -1)")" \
+    && ln -s "$BIN_DIR" /opt/llama/bin \
+    && ln -sf /opt/llama/bin/rpc-server /usr/local/bin/llama-rpc-server \
+    && ln -sf /opt/llama/bin/llama-cli  /usr/local/bin/llama-cli
+ENV LD_LIBRARY_PATH=/opt/llama/bin
+
+COPY --from=builder /src/target/release/node-agent /usr/local/bin/arcflare-node
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-# Bundle rpc-server binary if present (built from llama.cpp alongside llama-cli).
-# Build it with: cmake -DLLAMA_RPC=ON ... and copy llama-rpc-server into tools/
-COPY tools/llama-rpc-server /usr/local/bin/llama-rpc-server
-RUN chmod +x /usr/local/bin/llama-rpc-server || true
-
+# gRPC port + rpc-server port (compose remaps the rpc port per node)
 EXPOSE 9001 10001
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

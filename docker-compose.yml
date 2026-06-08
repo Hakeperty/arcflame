@@ -8,9 +8,11 @@ services:
       - "8000:8000"
     environment:
       - ARCFLARE_MODE=dev
+      - ARCFLARE_MODELS_DIR=/models
     volumes:
       - ./models:/models
-      - ./orchestrator:/app
+      # mount the package dir so it lands at /app/arcflare (matches PYTHONPATH=/app)
+      - ./orchestrator/src:/app
 
   node-alpha:
     build:
