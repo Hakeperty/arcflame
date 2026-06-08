@@ -250,10 +250,13 @@ message LoadStatus {
 
 message ForwardRequest {
   bytes hidden_state = 1;
-  // For KV cache updates between nodes
   int32 start_layer = 2;
   int32 num_layers = 3;
   repeated int32 input_ids = 4;
+  string text_prompt = 5;  // If set, node tokenizes this into input_ids
+  bool clear_context = 6;  // If true, reset KV cache before processing
+  int32 max_tokens = 7;    // Max tokens to generate (0 = use default)
+  float temperature = 8;   // Sampling temperature (0 = greedy)
 }
 
 message ForwardResponse {

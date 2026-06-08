@@ -1,14 +1,31 @@
 use crate::network::arcflare as pb;
 use pb::{LoadStatus, ShardConfig};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "inference")]
-use llama_cpp_4::{llama_backend::LlamaBackend, model::LlamaModel, model::params::LlamaModelParams};
+use llama_cpp_4::context::params::LlamaContextParams;
+#[cfg(feature = "inference")]
+use llama_cpp_4::llama_backend::LlamaBackend;
+#[cfg(feature = "inference")]
+use llama_cpp_4::model::params::LlamaModelParams;
+#[cfg(feature = "inference")]
+use llama_cpp_4::model::LlamaModel;
 
-// Global model state
 static CURRENT_SHARD: once_cell::sync::OnceCell<Arc<RwLock<Option<ShardState>>>> =
     once_cell::sync::OnceCell::new();
+
+#[cfg(feature = "inference")]
+static LLAMA_BACKEND: OnceLock<&'static LlamaBackend> = OnceLock::new();
+
+#[cfg(feature = "inference")]
+fn get_backend() -> Result<&'static LlamaBackend, String> {
+    LLAMA_BACKEND.get_or_try_init(|| {
+        let backend = LlamaBackend::init().map_err(|e| format!("Backend init: {}", e))?;
+        Ok(Box::leak(Box::new(backend)))
+    }).copied()
+}
 
 pub struct ShardState {
     pub model_name: String,
@@ -16,7 +33,7 @@ pub struct ShardState {
     pub num_layers: i32,
     pub has_lm_head: bool,
     #[cfg(feature = "inference")]
-    pub model: Option<LlamaModel>,
+    pub model: Option<LlamaModel>, // We own the model; context is created on-demand per generation
 }
 
 pub async fn get_loaded_model() -> Option<Arc<RwLock<Option<ShardState>>>> {
@@ -28,12 +45,12 @@ pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String>
 
     #[cfg(feature = "inference")]
     {
-        let backend = LlamaBackend::init()
-            .map_err(|e| format!("Failed to init backend: {}", e))?;
+        let _backend = get_backend()?;
+
         let params = LlamaModelParams::default()
             .with_n_gpu_layers(999);
         let model = LlamaModel::load_from_file(
-            &backend,
+            _backend,
             &config.gguf_path,
             &params,
         ).map_err(|e| format!("Failed to load model: {}", e))?;
@@ -61,6 +78,7 @@ pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String>
 
     #[cfg(not(feature = "inference"))]
     {
+        let _ = config;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let elapsed = start.elapsed();
         Ok(LoadStatus {

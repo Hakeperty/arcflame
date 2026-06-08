@@ -187,6 +187,83 @@ impl NodeAgent for ArcFlareNodeService {
             let output = async_stream::try_stream! {
                 while let Some(req) = stream.next().await {
                     let req = req?;
+
+                    // Full generation mode: tokenize prompt, autoregressively generate
+                    if !req.text_prompt.is_empty() {
+                        let max_tokens = if req.max_tokens > 0 { req.max_tokens as usize } else { 256 };
+                        let temp = if req.temperature > 0.0 { req.temperature } else { 0.0 };
+
+                        let state = crate::inference::model::get_loaded_model().await
+                            .ok_or_else(|| Status::internal("No model loaded"))?;
+                        let guard = state.read().await;
+                        let shard = guard.as_ref().ok_or_else(|| Status::internal("No shard"))?;
+                        let model = shard.model.as_ref().ok_or_else(|| Status::internal("No model"))?;
+
+                        let be = crate::inference::forward::backend()
+                            .map_err(|e| Status::internal(e))?;
+
+                        // Tokenize
+                        let prompt_tokens = model.str_to_token(&req.text_prompt, true)
+                            .map_err(|e| Status::internal(format!("Tokenize: {}", e)))?;
+
+                        // Create a fresh context
+                        let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default()
+                            .with_n_ctx(2048);
+                        let mut ctx = model.new_context(be, &ctx_params)
+                            .map_err(|e| Status::internal(format!("Ctx: {}", e)))?;
+
+                        // Decode prompt
+                        if !prompt_tokens.is_empty() {
+                            ctx.decode(&mut std::iter::once(&prompt_tokens[..]))
+                                .map_err(|e| Status::internal(format!("Decode prompt: {}", e)))?;
+                        }
+
+                        // Generation loop
+                        let mut token = 0i32;
+                        for _i in 0..max_tokens {
+                            if token != 0 {
+                                ctx.decode(&mut std::iter::once(&[token][..]))
+                                    .map_err(|e| Status::internal(format!("Decode token: {}", e)))?;
+                            }
+
+                            let n_tokens = ctx.n_tokens() as usize;
+                            if n_tokens == 0 { break; }
+
+                            let logits = ctx.logits();
+                            let n_vocab = logits.len();
+                            let sampled = if n_vocab > 0 {
+                                argmax_token(logits)
+                            } else {
+                                break;
+                            };
+
+                            let text = model.token_to_str(&[sampled])
+                                .unwrap_or_else(|_| format!("[token {}]", sampled));
+
+                            token = sampled;
+
+                            yield ForwardResponse {
+                                hidden_state: vec![],
+                                logits: text.as_bytes().to_vec(),
+                                has_logits: true,
+                                compute_time_ms: 0,
+                            };
+
+                            // Stop on EOS (typically token 2 for most models)
+                            if sampled == 2 { break; }
+                        }
+
+                        // Signal done
+                        yield ForwardResponse {
+                            hidden_state: vec![],
+                            logits: vec![],
+                            has_logits: false,
+                            compute_time_ms: 0,
+                        };
+                        continue;
+                    }
+
+                    // Standard mode: decode one step
                     let resp = crate::inference::forward(req).await
                         .map_err(|e| Status::internal(format!("Forward: {}", e)))?;
                     yield resp;
@@ -229,6 +306,16 @@ impl NodeAgent for ArcFlareNodeService {
             peak_memory_bytes: 0,
         }))
     }
+}
+
+/// Argmax over logits: pick the token with the highest score
+#[cfg(feature = "inference")]
+fn argmax_token(logits: &[f32]) -> i32 {
+    let (idx, _) = logits.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, &0.0));
+    idx as i32
 }
 
 pub async fn serve(

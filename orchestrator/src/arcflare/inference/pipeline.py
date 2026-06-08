@@ -14,7 +14,7 @@ class InferencePipeline:
 
     Pipeline modes:
     1. Local fallback — runs llama-cli subprocess on orchestrator
-    2. Distributed — load-balances requests across available node agents
+    2. Distributed — sends generation requests to available node agents
     3. (Future) True pipeline parallelism via per-layer shards
     """
 
@@ -114,8 +114,7 @@ class InferencePipeline:
     async def _load_shards_on_nodes(
         self, model_path: str, nodes: list[dict]
     ) -> bool:
-        """Attempt to load the model on each connected node via gRPC.
-        Returns True if at least one node loaded successfully (for validation)."""
+        """Attempt to load the model on each connected node via gRPC."""
         loaded = 0
         for node in nodes:
             node_id = node.get("node_id", "")
@@ -153,10 +152,9 @@ class InferencePipeline:
                     return int(line.split(":")[1].strip())
         except Exception:
             pass
-        # Fallback: common layer counts
         file_size = os.path.getsize(model_path)
         if file_size < 1_000_000_000:
-            return 24  # ~0.5B params: 24 layers
+            return 24
         return 32
 
     async def _distributed_inference(
@@ -167,14 +165,12 @@ class InferencePipeline:
         temperature: float,
         nodes: list[dict],
     ) -> AsyncGenerator[str, None]:
-        """Run inference distributed across nodes.
-        Falls back to local llama-cli if distribution fails."""
+        """Run inference distributed across nodes."""
         model_path = self._find_model(model)
         if not model_path:
             logger.warning("No model found for distributed inference")
             return
 
-        # Try to load shards on nodes
         await self._connect_to_nodes(nodes)
         shards_loaded = await self._load_shards_on_nodes(model_path, nodes)
 
@@ -184,7 +180,6 @@ class InferencePipeline:
                 yield token
             return
 
-        # Fall back to local if no nodes accepted shards
         logger.info("gRPC shard loading failed, using local llama-cli")
         async for token in self._local_inference(prompt, max_tokens, temperature):
             yield token
@@ -196,38 +191,57 @@ class InferencePipeline:
         temperature: float,
         nodes: list[dict],
     ) -> AsyncGenerator[str, None]:
-        """Send prompt through node pipeline via gRPC Forward calls."""
-        first_node = nodes[0] if nodes else None
-        if not first_node:
+        """Send prompt to a node via streaming gRPC and yield generated tokens.
+
+        Uses request-level load balancing: picks the best available node and
+        sends the full generation request via ForwardStream.
+        """
+        target = self._pick_target_node(nodes)
+        if not target:
+            logger.warning("No available node for inference")
             return
 
-        client = self.node_connections.get(first_node.get("node_id", ""))
+        node_id = target.get("node_id", "")
+        client = self.node_connections.get(node_id)
         if not client:
+            logger.warning(f"Node {node_id} not connected")
             return
 
-        # Send embedding request to first node
-        resp = await client.forward(
-            hidden_state=prompt.encode("utf-8"),
-            start_layer=0,
-            num_layers=1,
-            input_ids=[1],
-        )
+        logger.info(f"Streaming inference to node {node_id}")
 
-        if resp and resp.logits:
-            # Try to decode logits into text
-            try:
-                text = resp.logits.decode("utf-8", errors="replace")
-                for char in text:
-                    yield char
-                    await asyncio.sleep(0.01)
-                return
-            except Exception:
-                pass
+        try:
+            async for chunk in client.forward_stream(
+                text_prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                if chunk.logits:
+                    text = chunk.logits.decode("utf-8", errors="replace")
+                    for char in text:
+                        yield char
+                        await asyncio.sleep(0.005)
+                elif not chunk.has_logits:
+                    # Generation complete
+                    break
+        except Exception as e:
+            logger.warning(f"gRPC streaming inference failed: {e}")
+            logger.info("Falling back to local inference")
+            async for token in self._local_inference(prompt, max_tokens, temperature):
+                yield token
 
-        # Fallback: local inference
-        logger.info("gRPC inference returned no results, using local fallback")
-        async for token in self._local_inference(prompt, max_tokens, temperature):
-            yield token
+    def _pick_target_node(self, nodes: list[dict]) -> Optional[dict]:
+        """Pick the best node for inference using simple load balancing.
+
+        Prefers nodes with established connections, then picks randomly.
+        """
+        connected = [
+            n for n in nodes
+            if n.get("node_id", "") in self.node_connections
+        ]
+        if not connected:
+            return None
+        # Simple random load balancing
+        return random.choice(connected)
 
     async def _local_inference(
         self,

@@ -33,8 +33,6 @@ models/
 proto/arcflare.rs
 proto/*_pb2.py
 proto/*_pb2_grpc.py
-orchestrator/src/arcflare/arcflare_pb2.py
-orchestrator/src/arcflare/arcflare_pb2_grpc.py
 
 # Shards (output of gguf-splitter)
 shards/

@@ -1,7 +1,7 @@
 """gRPC client for communicating with ArcFlare node agents."""
 
 import logging
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import grpc
 
@@ -67,6 +67,36 @@ class NodeGrpcClient:
         except Exception as e:
             logger.error(f"LoadShard on {self.node_id} failed: {e}")
             return None
+
+    async def forward_stream(
+        self,
+        text_prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.0,
+    ) -> AsyncGenerator[ForwardResponse, None]:
+        """Stream generation from the node via ForwardStream.
+
+        Sends the text prompt to the node, which tokenizes it and generates
+        tokens autoregressively, streaming each decoded token back.
+        """
+        if not self._stub:
+            return
+
+        req = ForwardRequest(
+            text_prompt=text_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            clear_context=True,
+        )
+
+        try:
+            async for resp in self._stub.ForwardStream(iter([req]), timeout=300):
+                yield resp
+                if not resp.has_logits:
+                    break
+        except Exception as e:
+            logger.error(f"ForwardStream on {self.node_id} failed: {e}")
+            raise
 
     async def forward(
         self,
