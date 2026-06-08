@@ -186,11 +186,23 @@ class InferencePipeline:
                 raise RuntimeError(f"llama-cli exited {proc.returncode}: {stderr_text[:200]}")
 
             output = stdout_data.decode("utf-8", errors="replace")
+            capturing = False
             for line in output.split("\n"):
-                clean = line.strip()
-                if clean:
-                    yield clean + "\n"
-                    await asyncio.sleep(0.005)
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not capturing and stripped.startswith("> "):
+                    capturing = True
+                    continue
+                if capturing and stripped.startswith("["):
+                    break
+                if capturing and stripped.startswith("Exiting"):
+                    break
+                if capturing and stripped:
+                    clean = stripped.lstrip("|/-\\").replace("\b", "").replace("\r", "").strip()
+                    if clean:
+                        yield clean + "\n"
+                        await asyncio.sleep(0.005)
 
         except asyncio.TimeoutError:
             logger.error("llama-cli RPC inference timed out")

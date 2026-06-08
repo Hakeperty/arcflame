@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 logger = logging.getLogger("arcflare.api.management")
@@ -27,7 +27,7 @@ class RegisterRequest(BaseModel):
 
 
 @router.post("/nodes/register")
-async def register_node(req: RegisterRequest):
+async def register_node(req: RegisterRequest, request: Request):
     from ..main import discovery_service
     from ..cluster.discovery import NodeInfo
     import time
@@ -35,6 +35,7 @@ async def register_node(req: RegisterRequest):
     if discovery_service is None:
         raise HTTPException(503, "Discovery service not ready")
 
+    client_ip = request.client.host if request.client else "127.0.0.1"
     node_info = NodeInfo(
         node_id=req.node_id,
         node_name=req.name,
@@ -42,7 +43,7 @@ async def register_node(req: RegisterRequest):
         rpc_port=req.rpc_port,
         version=req.version,
         os=req.os,
-        ip_address="",
+        ip_address=client_ip,
         last_seen=time.time(),
         status="alive",
     )
