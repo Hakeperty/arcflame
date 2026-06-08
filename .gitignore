@@ -49,3 +49,6 @@ tools/llama-bin/
 
 # Test results
 tests/results/
+
+# VM test artifacts (images, keys, seeds — never commit)
+vmtest/
