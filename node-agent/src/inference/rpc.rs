@@ -34,6 +34,9 @@ impl RpcServer {
             .arg("0.0.0.0")
             .arg("-p")
             .arg(self.port.to_string())
+            // backstop: if the handle is dropped without an explicit stop(),
+            // the child is killed instead of being orphaned (holds the port)
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("Failed to spawn rpc-server ({}): {}", self.bin.display(), e))?;
 
