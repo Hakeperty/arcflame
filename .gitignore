@@ -52,3 +52,6 @@ tests/results/
 
 # VM test artifacts (images, keys, seeds — never commit)
 vmtest/
+
+# Claude Code local session/settings
+.claude/
