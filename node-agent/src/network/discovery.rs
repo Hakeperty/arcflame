@@ -12,6 +12,7 @@ pub struct DiscoveryMessage {
     pub node_id: String,
     pub node_name: String,
     pub grpc_port: u16,
+    pub rpc_port: u16,  // 0 = not running
     pub version: String,
     pub os: String,
 }
@@ -20,6 +21,7 @@ pub fn start_broadcaster(
     node_id: String,
     node_name: String,
     grpc_port: u16,
+    rpc_port: u16,
     shutdown: Arc<RwLock<bool>>,
 ) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
@@ -37,6 +39,7 @@ pub fn start_broadcaster(
         node_id,
         node_name,
         grpc_port,
+        rpc_port,
         version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
     };

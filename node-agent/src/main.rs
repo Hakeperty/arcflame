@@ -1,6 +1,5 @@
 mod hardware;
 mod network;
-#[cfg(feature = "inference")]
 mod inference;
 mod overclocking;
 mod drivers;
@@ -8,6 +7,7 @@ mod tuning;
 
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +29,18 @@ struct Args {
 
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Start llama.cpp rpc-server alongside the node agent.
+    #[arg(long, default_value = "false")]
+    enable_rpc: bool,
+
+    /// Port for llama.cpp rpc-server (default: grpc_port + 1000).
+    #[arg(long)]
+    rpc_port: Option<u16>,
+
+    /// Path to llama-rpc-server binary.
+    #[arg(long, default_value = "llama-rpc-server")]
+    rpc_server_bin: PathBuf,
 }
 
 #[tokio::main]
@@ -55,6 +67,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hardware_report.memory.as_ref().map_or(0, |m| m.total_bytes),
     );
 
+    // Determine effective RPC port
+    let rpc_port: u16 = if args.enable_rpc {
+        args.rpc_port.unwrap_or(args.grpc_port + 1000)
+    } else {
+        0
+    };
+
+    // Start llama.cpp rpc-server if requested
+    if args.enable_rpc {
+        let rpc = inference::rpc::RpcServer::new(rpc_port, args.rpc_server_bin.clone());
+        match rpc.start().await {
+            Ok(()) => tracing::info!("llama rpc-server running on port {}", rpc_port),
+            Err(e) => tracing::warn!("Could not start rpc-server: {} (continuing without it)", e),
+        }
+        // Keep server alive for the process lifetime (leak is intentional here)
+        Box::leak(Box::new(rpc));
+    }
+
     let addr: SocketAddr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
 
     let node_name = args.name.unwrap_or_else(|| hostname.clone());
@@ -62,12 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name_clone = node_name.clone();
     let grpc_port = args.grpc_port;
 
-    // Start UDP discovery broadcaster
+    // Start UDP discovery broadcaster (includes rpc_port)
     let shutdown = Arc::new(RwLock::new(false));
     network::discovery::start_broadcaster(
         node_id_clone,
         node_name_clone,
         grpc_port,
+        rpc_port,
         shutdown,
     );
 
@@ -80,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "node_id": node_id,
             "name": node_name,
             "grpc_port": grpc_port,
+            "rpc_port": rpc_port,
             "version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
         });
@@ -102,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         node_name,
         hardware_report,
         addr,
+        rpc_port,
     );
 
     tracing::info!("Node agent starting on {}", addr);

@@ -21,6 +21,7 @@ class RegisterRequest(BaseModel):
     node_id: str
     name: str
     grpc_port: int = 9001
+    rpc_port: int = 0
     version: str = "0.0.0"
     os: str = "unknown"
 
@@ -38,6 +39,7 @@ async def register_node(req: RegisterRequest):
         node_id=req.node_id,
         node_name=req.name,
         grpc_port=req.grpc_port,
+        rpc_port=req.rpc_port,
         version=req.version,
         os=req.os,
         ip_address="",
@@ -45,7 +47,8 @@ async def register_node(req: RegisterRequest):
         status="alive",
     )
     discovery_service.nodes[req.node_id] = node_info
-    logger.info(f"Node registered via HTTP: {req.name} ({req.node_id})")
+    logger.info(f"Node registered via HTTP: {req.name} ({req.node_id})"
+                + (f" rpc={req.rpc_port}" if req.rpc_port else ""))
     return {"status": "registered", "node_id": req.node_id}
 
 
@@ -77,6 +80,7 @@ async def cluster_status():
     nodes = discovery_service.get_nodes()
     total_ram = sum(n.get("memory", {}).get("total_bytes", 0) for n in nodes)
     total_gpus = sum(1 for n in nodes if n.get("gpus"))
+    rpc_endpoints = discovery_service.get_rpc_endpoints()
 
     return {
         "status": "running",
@@ -84,6 +88,10 @@ async def cluster_status():
         "total_ram_gb": total_ram / (1024**3),
         "total_gpus": total_gpus,
         "models": discovery_service.get_available_models(),
+        "rpc_endpoints": rpc_endpoints,
+        "pipeline_mode": "rpc_distributed" if len(rpc_endpoints) >= 2 else (
+            "single_rpc" if len(rpc_endpoints) == 1 else "local_fallback"
+        ),
     }
 
 

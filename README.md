@@ -111,11 +111,39 @@ uvicorn arcflare.main:app --host 0.0.0.0 --port 8000
 
 ### Step 8 — Join nodes to the cluster
 
-**On each worker machine:**
+**On each worker machine (basic):**
 
 ```bash
 arcflare-node --orchestrator-host <orchestrator-ip>
 ```
+
+**With RPC pipeline parallelism enabled (Phase 2):**
+
+Each node runs `llama-rpc-server` alongside the agent. The orchestrator then
+sends inference requests via `llama-cli --rpc <node1:port>,<node2:port>,...`
+so model tensors are split across all machines.
+
+Build `llama-rpc-server` once from llama.cpp with `LLAMA_RPC=ON`:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DLLAMA_RPC=ON
+cmake --build build --config Release -j$(nproc)
+cp build/bin/llama-rpc-server /usr/local/bin/
+```
+
+Then start each node with `--enable-rpc`:
+
+```bash
+arcflare-node \
+    --orchestrator-host <orchestrator-ip> \
+    --enable-rpc \
+    --rpc-port 10001 \
+    --rpc-server-bin /usr/local/bin/llama-rpc-server
+```
+
+The orchestrator detects rpc endpoints automatically and switches to RPC mode.
 
 **On the orchestrator machine itself** (if also running a node):
 
@@ -201,6 +229,28 @@ curl http://localhost:8000/api/nodes/<node-id>
 ### OpenAI-compatible integration
 
 ArcFlare works as a drop-in OpenAI backend for any tool.
+
+## Pipeline Parallelism (Phase 2)
+
+When nodes run with `--enable-rpc`, the orchestrator automatically detects
+their `llama-rpc-server` endpoints and upgrades from single-node inference to
+true distributed inference:
+
+```
+Request → orchestrator (llama-cli)
+                ├─── --rpc node-alpha:10001  (layers 0..N/2)
+                └─── --rpc node-beta:10002   (layers N/2..N)
+```
+
+The orchestrator picks the inference mode in this order:
+
+1. **RPC distributed** — if any node reports an rpc_port, all rpc endpoints are
+   passed to `llama-cli --rpc`. Model tensors are split automatically.
+2. **gRPC streaming** — falls back to sending the full prompt to one node via
+   the ArcFlare gRPC ForwardStream protocol.
+3. **Local fallback** — runs `llama-cli` directly on the orchestrator.
+
+The active mode is reported in `/api/cluster/status` as `pipeline_mode`.
 
 ## Auto-Discovery
 
@@ -306,7 +356,7 @@ bash tools/scripts/test-docker.sh
 - [x] Real inference via llama-cli
 
 ### Phase 2 🔜
-- [ ] Full distributed inference pipeline (in progress)
+- [x] Full distributed inference pipeline — llama.cpp RPC backend
 - [ ] P2P shard transfer (libp2p)
 - [ ] Custom layer partitioning engine
 - [ ] llama-cpp-4 inference integration

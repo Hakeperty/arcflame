@@ -29,6 +29,7 @@ service NodeAgent {
   rpc ForwardStream(stream ForwardRequest) returns (stream ForwardResponse);
   rpc UnloadShard(Empty) returns (Empty);
   rpc GetInferenceStats(Empty) returns (InferenceStats);
+  rpc GetRpcEndpoint(Empty) returns (RpcEndpoint);
 }
 
 // ─── Orchestrator Service (for nodes to report back) ───
@@ -49,6 +50,7 @@ message RegisterRequest {
   string os = 4;
   uint32 grpc_port = 5;
   repeated string capabilities = 6;
+  uint32 rpc_port = 7;  // llama.cpp rpc-server port; 0 = not running
 }
 
 message RegisterResponse {
@@ -273,6 +275,12 @@ message InferenceStats {
   int64 total_tokens_processed = 4;
   int64 kv_cache_used_bytes = 5;
   int64 peak_memory_bytes = 6;
+}
+
+message RpcEndpoint {
+  bool running = 1;
+  uint32 port = 2;
+  string address = 3;  // host:port, ready for --rpc flag
 }
 
 // ─── Orchestrator Messages ───

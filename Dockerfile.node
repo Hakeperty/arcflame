@@ -5,4 +5,11 @@ COPY target/release/node-agent /usr/local/bin/arcflare-node
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
+# Bundle rpc-server binary if present (built from llama.cpp alongside llama-cli).
+# Build it with: cmake -DLLAMA_RPC=ON ... and copy llama-rpc-server into tools/
+COPY tools/llama-rpc-server /usr/local/bin/llama-rpc-server
+RUN chmod +x /usr/local/bin/llama-rpc-server || true
+
+EXPOSE 9001 10001
+
 ENTRYPOINT ["/docker-entrypoint.sh"]

@@ -21,6 +21,11 @@ services:
       - ARCFLARE_GRPC_PORT=9001
       - ARCFLARE_ORCHESTRATOR_HOST=orchestrator
       - ARCFLARE_ORCHESTRATOR_PORT=8000
+      - ARCFLARE_ENABLE_RPC=true
+      - ARCFLARE_RPC_PORT=10001
+    ports:
+      - "9001:9001"
+      - "10001:10001"
     volumes:
       - ./models:/models
     depends_on: [orchestrator]
@@ -34,6 +39,11 @@ services:
       - ARCFLARE_GRPC_PORT=9002
       - ARCFLARE_ORCHESTRATOR_HOST=orchestrator
       - ARCFLARE_ORCHESTRATOR_PORT=8000
+      - ARCFLARE_ENABLE_RPC=true
+      - ARCFLARE_RPC_PORT=10002
+    ports:
+      - "9002:9002"
+      - "10002:10002"
     volumes:
       - ./models:/models
     depends_on: [orchestrator]

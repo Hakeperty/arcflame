@@ -10,7 +10,7 @@ use pb::{
     BenchmarkRequest, BenchmarkResult, DriverReport, Empty, ForwardRequest,
     ForwardResponse, HardwareReport, HeartbeatRequest, HeartbeatResponse,
     InferenceStats, LoadStatus, OverclockingStatus, PerfModeRequest,
-    PerfModeResponse, RegisterRequest, RegisterResponse, ShardConfig,
+    PerfModeResponse, RegisterRequest, RegisterResponse, RpcEndpoint, ShardConfig,
     TuningRequest, TuningResponse,
 };
 
@@ -20,6 +20,7 @@ pub struct ArcFlareNodeService {
     node_name: String,
     hardware_report: HardwareReport,
     _addr: SocketAddr,
+    rpc_port: u16,
 }
 
 impl ArcFlareNodeService {
@@ -28,8 +29,9 @@ impl ArcFlareNodeService {
         node_name: String,
         hardware_report: HardwareReport,
         addr: SocketAddr,
+        rpc_port: u16,
     ) -> Self {
-        Self { node_id, node_name, hardware_report, _addr: addr }
+        Self { node_id, node_name, hardware_report, _addr: addr, rpc_port }
     }
 }
 
@@ -376,6 +378,19 @@ impl NodeAgent for ArcFlareNodeService {
             total_tokens_processed: 0,
             kv_cache_used_bytes: 0,
             peak_memory_bytes: 0,
+        }))
+    }
+
+    async fn get_rpc_endpoint(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<RpcEndpoint>, Status> {
+        let running = self.rpc_port > 0;
+        Ok(Response::new(RpcEndpoint {
+            running,
+            port: self.rpc_port as u32,
+            // Address is filled in by the orchestrator which knows the node's IP.
+            address: String::new(),
         }))
     }
 }

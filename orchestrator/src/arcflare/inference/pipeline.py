@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import shutil
 from typing import AsyncGenerator, Optional
 
 from .grpc_client import NodeGrpcClient
@@ -12,10 +13,13 @@ logger = logging.getLogger("arcflare.inference")
 class InferencePipeline:
     """Coordinates distributed inference across the cluster.
 
-    Pipeline modes:
-    1. Local fallback — runs llama-cli subprocess on orchestrator
-    2. Distributed — sends generation requests to available node agents
-    3. (Future) True pipeline parallelism via per-layer shards
+    Pipeline modes (tried in order):
+    1. RPC distributed — orchestrator runs llama-cli with --rpc <node1>,<node2>,...
+       Each node must run llama-rpc-server (--enable-rpc on the node agent).
+       Requires 1+ nodes with rpc_port set. llama-cli keeps all computation on
+       the nodes; the model is split by tensor automatically.
+    2. gRPC streaming — sends generation to one node via our ForwardStream proto.
+    3. Local fallback — runs llama-cli subprocess on the orchestrator itself.
     """
 
     def __init__(self):
@@ -91,12 +95,25 @@ class InferencePipeline:
         from ..main import discovery_service
 
         nodes = discovery_service.get_nodes() if discovery_service else []
+        rpc_endpoints = discovery_service.get_rpc_endpoints() if discovery_service else []
+
+        # Mode 1: RPC distributed — requires at least one rpc-server endpoint
+        if rpc_endpoints:
+            logger.info(f"RPC distributed mode: {len(rpc_endpoints)} endpoint(s): {rpc_endpoints}")
+            try:
+                async for token in self._rpc_distributed_inference(
+                    model, prompt, max_tokens, temperature, rpc_endpoints
+                ):
+                    yield token
+                return
+            except Exception as e:
+                logger.warning(f"RPC distributed inference failed ({e}), falling back")
+
+        # Mode 2: gRPC streaming to a single node
         alive = [n for n in nodes if n.get("grpc_port") and n.get("ip_address")]
         active_connections = list(self.node_connections.keys())
-
-        # Try distributed inference if we have connected nodes with shards loaded
         if alive and active_connections:
-            logger.info(f"Distributed mode: {len(alive)} nodes available")
+            logger.info(f"gRPC stream mode: {len(alive)} nodes available")
             try:
                 await self._connect_to_nodes(alive)
                 async for token in self._distributed_inference(
@@ -105,16 +122,85 @@ class InferencePipeline:
                     yield token
                 return
             except Exception as e:
-                logger.warning(f"Distributed inference failed ({e}), falling back to local")
+                logger.warning(f"gRPC inference failed ({e}), falling back to local")
 
+        # Mode 3: local llama-cli
         logger.info("Local inference mode")
         async for token in self._local_inference(prompt, max_tokens, temperature):
             yield token
 
+    # ─── RPC distributed inference ───
+
+    async def _rpc_distributed_inference(
+        self,
+        model: str,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        rpc_endpoints: list[str],
+    ) -> AsyncGenerator[str, None]:
+        """Run llama-cli with --rpc pointing at all node rpc-servers.
+
+        llama-cli offloads tensor shards to each rpc-server automatically,
+        distributing model layers across the cluster.
+        """
+        model_path = self._find_model(model)
+        llama_cli = self._find_llama_cli()
+
+        if not model_path:
+            raise RuntimeError("No model found for RPC inference")
+        if not llama_cli:
+            raise RuntimeError("llama-cli binary not found for RPC inference")
+
+        rpc_arg = ",".join(rpc_endpoints)
+        logger.info(f"Invoking llama-cli --rpc {rpc_arg} with model {model_path}")
+
+        cmd = [
+            llama_cli,
+            "-m", model_path,
+            "--rpc", rpc_arg,
+            "-p", prompt,
+            "-n", str(max_tokens),
+            "--no-display-prompt",
+            "--single-turn",
+        ]
+
+        if temperature > 0:
+            cmd += ["--temp", str(temperature)]
+        else:
+            cmd += ["--greedy"]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(), timeout=600
+            )
+
+            if proc.returncode != 0:
+                stderr_text = stderr_data.decode("utf-8", errors="replace")
+                raise RuntimeError(f"llama-cli exited {proc.returncode}: {stderr_text[:200]}")
+
+            output = stdout_data.decode("utf-8", errors="replace")
+            for line in output.split("\n"):
+                clean = line.strip()
+                if clean:
+                    yield clean + "\n"
+                    await asyncio.sleep(0.005)
+
+        except asyncio.TimeoutError:
+            logger.error("llama-cli RPC inference timed out")
+            raise RuntimeError("RPC inference timed out")
+
+    # ─── gRPC pipeline (single-node fallback) ───
+
     async def _load_shards_on_nodes(
         self, model_path: str, nodes: list[dict]
     ) -> bool:
-        """Attempt to load the model on each connected node via gRPC."""
         loaded = 0
         for node in nodes:
             node_id = node.get("node_id", "")
@@ -140,7 +226,6 @@ class InferencePipeline:
         return loaded > 0
 
     def _get_model_layer_count(self, model_path: str) -> Optional[int]:
-        """Quick heuristic: try gguf-splitter, or guess from model size."""
         try:
             import subprocess
             result = subprocess.run(
@@ -165,7 +250,6 @@ class InferencePipeline:
         temperature: float,
         nodes: list[dict],
     ) -> AsyncGenerator[str, None]:
-        """Run inference distributed across nodes."""
         model_path = self._find_model(model)
         if not model_path:
             logger.warning("No model found for distributed inference")
@@ -191,11 +275,6 @@ class InferencePipeline:
         temperature: float,
         nodes: list[dict],
     ) -> AsyncGenerator[str, None]:
-        """Send prompt to a node via streaming gRPC and yield generated tokens.
-
-        Uses request-level load balancing: picks the best available node and
-        sends the full generation request via ForwardStream.
-        """
         target = self._pick_target_node(nodes)
         if not target:
             logger.warning("No available node for inference")
@@ -221,7 +300,6 @@ class InferencePipeline:
                         yield char
                         await asyncio.sleep(0.005)
                 elif not chunk.has_logits:
-                    # Generation complete
                     break
         except Exception as e:
             logger.warning(f"gRPC streaming inference failed: {e}")
@@ -230,18 +308,15 @@ class InferencePipeline:
                 yield token
 
     def _pick_target_node(self, nodes: list[dict]) -> Optional[dict]:
-        """Pick the best node for inference using simple load balancing.
-
-        Prefers nodes with established connections, then picks randomly.
-        """
         connected = [
             n for n in nodes
             if n.get("node_id", "") in self.node_connections
         ]
         if not connected:
             return None
-        # Simple random load balancing
         return random.choice(connected)
+
+    # ─── Local fallback ───
 
     async def _local_inference(
         self,

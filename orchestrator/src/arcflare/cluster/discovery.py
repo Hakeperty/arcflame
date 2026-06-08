@@ -24,6 +24,7 @@ class NodeInfo:
     hardware: Optional[dict] = None
     status: str = "discovered"
     ip_address: str = ""
+    rpc_port: int = 0  # 0 = rpc-server not running on this node
 
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
@@ -74,15 +75,18 @@ class DiscoveryService:
             node_id = msg.get("node_id", "")
             node_name = msg.get("node_name", "unknown")
             grpc_port = msg.get("grpc_port", 0)
+            rpc_port = msg.get("rpc_port", 0)
             version = msg.get("version", "0.0.0")
             os_name = msg.get("os", "unknown")
 
             if node_id not in self.nodes:
-                logger.info(f"New node discovered: {node_name} ({node_id}) at {addr[0]}")
+                logger.info(f"New node discovered: {node_name} ({node_id}) at {addr[0]}"
+                            + (f" rpc={rpc_port}" if rpc_port else ""))
                 self.nodes[node_id] = NodeInfo(
                     node_id=node_id,
                     node_name=node_name,
                     grpc_port=grpc_port,
+                    rpc_port=rpc_port,
                     version=version,
                     os=os_name,
                     ip_address=addr[0],
@@ -90,6 +94,8 @@ class DiscoveryService:
             else:
                 self.nodes[node_id].last_seen = time.time()
                 self.nodes[node_id].status = "alive"
+                # Update rpc_port in case node restarted with different config
+                self.nodes[node_id].rpc_port = rpc_port
 
         except (json.JSONDecodeError, KeyError) as e:
             logger.debug(f"Invalid discovery message from {addr}: {e}")
@@ -101,6 +107,15 @@ class DiscoveryService:
     def get_node(self, node_id: str) -> Optional[dict]:
         node = self.nodes.get(node_id)
         return asdict(node) if node else None
+
+    def get_rpc_endpoints(self) -> List[str]:
+        """Return list of 'host:port' for all nodes running rpc-server."""
+        self._prune_dead_nodes()
+        endpoints = []
+        for n in self.nodes.values():
+            if n.rpc_port and n.ip_address:
+                endpoints.append(f"{n.ip_address}:{n.rpc_port}")
+        return endpoints
 
     def get_available_models(self) -> List[str]:
         models = set()
