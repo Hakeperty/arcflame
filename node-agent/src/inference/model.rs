@@ -1,13 +1,8 @@
 use crate::network::arcflare as pb;
 use pb::{LoadStatus, ShardConfig};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use tokio::sync::RwLock;
 
-#[cfg(feature = "inference")]
-use llama_cpp_4::context::params::LlamaContextParams;
-#[cfg(feature = "inference")]
-use llama_cpp_4::llama_backend::LlamaBackend;
 #[cfg(feature = "inference")]
 use llama_cpp_4::model::params::LlamaModelParams;
 #[cfg(feature = "inference")]
@@ -16,24 +11,17 @@ use llama_cpp_4::model::LlamaModel;
 static CURRENT_SHARD: once_cell::sync::OnceCell<Arc<RwLock<Option<ShardState>>>> =
     once_cell::sync::OnceCell::new();
 
-#[cfg(feature = "inference")]
-static LLAMA_BACKEND: OnceLock<&'static LlamaBackend> = OnceLock::new();
-
-#[cfg(feature = "inference")]
-fn get_backend() -> Result<&'static LlamaBackend, String> {
-    LLAMA_BACKEND.get_or_try_init(|| {
-        let backend = LlamaBackend::init().map_err(|e| format!("Backend init: {}", e))?;
-        Ok(Box::leak(Box::new(backend)))
-    }).copied()
-}
-
 pub struct ShardState {
+    #[allow(dead_code)]
     pub model_name: String,
+    #[allow(dead_code)]
     pub first_layer: i32,
+    #[allow(dead_code)]
     pub num_layers: i32,
+    #[allow(dead_code)]
     pub has_lm_head: bool,
     #[cfg(feature = "inference")]
-    pub model: Option<LlamaModel>, // We own the model; context is created on-demand per generation
+    pub model: Option<LlamaModel>,
 }
 
 pub async fn get_loaded_model() -> Option<Arc<RwLock<Option<ShardState>>>> {
@@ -45,15 +33,19 @@ pub async fn load_shard_model(config: ShardConfig) -> Result<LoadStatus, String>
 
     #[cfg(feature = "inference")]
     {
-        let _backend = get_backend()?;
+        // Backend must be initialized first (from forward::backend)
+        let _ = crate::inference::forward::backend()?;
 
-        let params = LlamaModelParams::default()
-            .with_n_gpu_layers(999);
-        let model = LlamaModel::load_from_file(
-            _backend,
-            &config.gguf_path,
-            &params,
-        ).map_err(|e| format!("Failed to load model: {}", e))?;
+        // Drop params before any await to avoid Send issues
+        let model = {
+            let params = LlamaModelParams::default()
+                .with_n_gpu_layers(999);
+            LlamaModel::load_from_file(
+                crate::inference::forward::backend().map_err(|e| e.to_string())?,
+                &config.gguf_path,
+                &params,
+            ).map_err(|e| format!("Failed to load model: {}", e))?
+        };
 
         let state = ShardState {
             model_name: config.model_name.clone(),

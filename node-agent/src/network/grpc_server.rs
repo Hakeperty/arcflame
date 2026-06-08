@@ -182,88 +182,160 @@ impl NodeAgent for ArcFlareNodeService {
         #[cfg(feature = "inference")]
         {
             use tokio_stream::StreamExt;
+            use tokio_stream::wrappers::ReceiverStream;
             let mut stream = request.into_inner();
 
             let output = async_stream::try_stream! {
                 while let Some(req) = stream.next().await {
                     let req = req?;
 
-                    // Full generation mode: tokenize prompt, autoregressively generate
                     if !req.text_prompt.is_empty() {
+                        let prompt_text = req.text_prompt.clone();
                         let max_tokens = if req.max_tokens > 0 { req.max_tokens as usize } else { 256 };
-                        let temp = if req.temperature > 0.0 { req.temperature } else { 0.0 };
 
-                        let state = crate::inference::model::get_loaded_model().await
-                            .ok_or_else(|| Status::internal("No model loaded"))?;
-                        let guard = state.read().await;
-                        let shard = guard.as_ref().ok_or_else(|| Status::internal("No shard"))?;
-                        let model = shard.model.as_ref().ok_or_else(|| Status::internal("No model"))?;
+                        let (tx, rx) = tokio::sync::mpsc::channel::<
+                            Result<ForwardResponse, Status>
+                        >(32);
 
-                        let be = crate::inference::forward::backend()
-                            .map_err(|e| Status::internal(e))?;
+                        tokio::task::spawn_blocking(move || {
+                            use llama_cpp_4::context::params::LlamaContextParams;
+                            use llama_cpp_4::llama_backend::LlamaBackend;
+                            use llama_cpp_4::llama_batch::LlamaBatch;
+                            use llama_cpp_4::model::params::LlamaModelParams;
+                            use llama_cpp_4::model::{AddBos, LlamaModel, Special};
+                            use std::num::NonZero;
 
-                        // Tokenize
-                        let prompt_tokens = model.str_to_token(&req.text_prompt, true)
-                            .map_err(|e| Status::internal(format!("Tokenize: {}", e)))?;
+                            let be = match LlamaBackend::init() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(Status::internal(
+                                        format!("Backend init: {}", e)
+                                    )));
+                                    return;
+                                }
+                            };
 
-                        // Create a fresh context
-                        let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default()
-                            .with_n_ctx(2048);
-                        let mut ctx = model.new_context(be, &ctx_params)
-                            .map_err(|e| Status::internal(format!("Ctx: {}", e)))?;
+                            let model_path = std::env::var("ARCFLARE_MODEL_PATH")
+                                .unwrap_or_else(|_| {
+                                    "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string()
+                                });
 
-                        // Decode prompt
-                        if !prompt_tokens.is_empty() {
-                            ctx.decode(&mut std::iter::once(&prompt_tokens[..]))
-                                .map_err(|e| Status::internal(format!("Decode prompt: {}", e)))?;
-                        }
+                            let model_params = LlamaModelParams::default()
+                                .with_n_gpu_layers(999);
+                            let model = match LlamaModel::load_from_file(&be, &model_path, &model_params)
+                            {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(Status::internal(
+                                        format!("Load model: {}", e)
+                                    )));
+                                    return;
+                                }
+                            };
 
-                        // Generation loop
-                        let mut token = 0i32;
-                        for _i in 0..max_tokens {
-                            if token != 0 {
-                                ctx.decode(&mut std::iter::once(&[token][..]))
-                                    .map_err(|e| Status::internal(format!("Decode token: {}", e)))?;
+                            let prompt_tokens = match model.str_to_token(&prompt_text, AddBos::Always)
+                            {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(Status::internal(
+                                        format!("Tokenize: {}", e)
+                                    )));
+                                    return;
+                                }
+                            };
+
+                            let n_ctx = match NonZero::new(2048u32) {
+                                Some(n) => n,
+                                None => {
+                                    let _ = tx.blocking_send(Err(Status::internal("Invalid ctx")));
+                                    return;
+                                }
+                            };
+                            let ctx_params = LlamaContextParams::default()
+                                .with_n_ctx(Some(n_ctx));
+                            let mut ctx = match model.new_context(&be, ctx_params) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(Status::internal(
+                                        format!("Ctx: {}", e)
+                                    )));
+                                    return;
+                                }
+                            };
+
+                            // Batch and decode the prompt
+                            let mut batch = LlamaBatch::new(prompt_tokens.len(), 1);
+                            if let Err(e) = batch.add_sequence(&prompt_tokens, 0, true) {
+                                let _ = tx.blocking_send(Err(Status::internal(
+                                    format!("Batch: {}", e)
+                                )));
+                                return;
+                            }
+                            if let Err(e) = ctx.decode(&mut batch) {
+                                let _ = tx.blocking_send(Err(Status::internal(
+                                    format!("Decode prompt: {}", e)
+                                )));
+                                return;
                             }
 
-                            let n_tokens = ctx.n_tokens() as usize;
-                            if n_tokens == 0 { break; }
-
-                            let logits = ctx.logits();
-                            let n_vocab = logits.len();
-                            let sampled = if n_vocab > 0 {
-                                argmax_token(logits)
-                            } else {
-                                break;
+                            let argmax = |logits: &[f32]| -> i32 {
+                                logits.iter()
+                                    .enumerate()
+                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .map(|(i, _)| i as i32)
+                                    .unwrap_or(0)
                             };
 
-                            let text = model.token_to_str(&[sampled])
-                                .unwrap_or_else(|_| format!("[token {}]", sampled));
+                            let mut last_token = llama_cpp_4::token::LlamaToken(0);
+                            for pos in 0..max_tokens {
+                                if last_token.0 != 0 {
+                                    let mut next_batch = LlamaBatch::new(1, 1);
+                                    if next_batch.add(last_token, pos as i32, &[0], true).is_err() {
+                                        break;
+                                    }
+                                    if ctx.decode(&mut next_batch).is_err() {
+                                        break;
+                                    }
+                                }
 
-                            token = sampled;
+                                let logits = ctx.get_logits();
+                                if logits.is_empty() {
+                                    break;
+                                }
 
-                            yield ForwardResponse {
+                                let sampled_id = argmax(logits);
+                                last_token = llama_cpp_4::token::LlamaToken(sampled_id);
+
+                                let text = model.token_to_str(last_token, Special::Tokenize)
+                                    .unwrap_or_else(|_| format!("[{}]", sampled_id));
+
+                                if tx.blocking_send(Ok(ForwardResponse {
+                                    hidden_state: vec![],
+                                    logits: text.as_bytes().to_vec(),
+                                    has_logits: true,
+                                    compute_time_ms: 0,
+                                })).is_err() {
+                                    break;
+                                }
+
+                                if sampled_id == 2 { break; }
+                            }
+
+                            let _ = tx.blocking_send(Ok(ForwardResponse {
                                 hidden_state: vec![],
-                                logits: text.as_bytes().to_vec(),
-                                has_logits: true,
+                                logits: vec![],
+                                has_logits: false,
                                 compute_time_ms: 0,
-                            };
+                            }));
+                        });
 
-                            // Stop on EOS (typically token 2 for most models)
-                            if sampled == 2 { break; }
+                        let mut rx_stream = ReceiverStream::new(rx);
+                        while let Some(resp) = rx_stream.next().await {
+                            yield resp?;
                         }
-
-                        // Signal done
-                        yield ForwardResponse {
-                            hidden_state: vec![],
-                            logits: vec![],
-                            has_logits: false,
-                            compute_time_ms: 0,
-                        };
                         continue;
                     }
 
-                    // Standard mode: decode one step
                     let resp = crate::inference::forward(req).await
                         .map_err(|e| Status::internal(format!("Forward: {}", e)))?;
                     yield resp;
@@ -306,16 +378,6 @@ impl NodeAgent for ArcFlareNodeService {
             peak_memory_bytes: 0,
         }))
     }
-}
-
-/// Argmax over logits: pick the token with the highest score
-#[cfg(feature = "inference")]
-fn argmax_token(logits: &[f32]) -> i32 {
-    let (idx, _) = logits.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0, &0.0));
-    idx as i32
 }
 
 pub async fn serve(
