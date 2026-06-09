@@ -57,7 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| hostname_cached.clone());
-    let node_id = format!("{}-{}", machine_id, args.grpc_port);
+    // Include the hostname: machines imaged/cloned from one disk share a
+    // machine-id, so machine_id+port alone collides across cloned nodes (common
+    // on "flash one SD card, clone it" scrap-hardware setups). hostname is
+    // distinct per node and keeps node_id stable + unique.
+    let node_id = format!("{}-{}-{}", machine_id, hostname_cached, args.grpc_port);
     let hostname = hostname_cached;
 
     let hardware_report = hardware::collect().await?;
