@@ -25,27 +25,48 @@ _PAGE = """<!doctype html>
   .pill { font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); color:var(--muted); }
   .pill.live { color:var(--green); border-color:var(--green); }
   main { padding:24px; max-width:1100px; margin:0 auto; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin-bottom:24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:24px; }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
   .card .label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
-  .card .value { font-size:28px; font-weight:600; margin-top:6px; }
+  .card .value { font-size:28px; font-weight:600; margin-top:6px; word-break:break-word; }
   .card .value.mode { font-size:18px; color:var(--accent); }
   h2 { font-size:14px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin:24px 0 10px; }
+  .table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:10px; }
   table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
   th,td { text-align:left; padding:10px 14px; border-bottom:1px solid var(--border); font-size:13px; }
-  th { color:var(--muted); font-weight:600; background:#11161d; }
+  th { color:var(--muted); font-weight:600; background:#11161d; white-space:nowrap; }
   tr:last-child td { border-bottom:none; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--green); margin-right:6px; }
   .dot.stale { background:var(--muted); }
   .empty { color:var(--muted); padding:18px; text-align:center; }
   .chat { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
-  textarea { width:100%; min-height:64px; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:10px; font-family:inherit; font-size:14px; resize:vertical; }
-  .row { display:flex; gap:10px; align-items:center; margin-top:10px; }
-  button { background:var(--accent); color:#0d1117; border:none; border-radius:8px; padding:9px 18px; font-weight:600; cursor:pointer; font-size:14px; }
+  textarea { width:100%; min-height:64px; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:10px; font-family:inherit; font-size:16px; resize:vertical; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  button { background:var(--accent); color:#0d1117; border:none; border-radius:8px; padding:11px 20px; font-weight:600; cursor:pointer; font-size:15px; min-height:44px; }
   button:disabled { opacity:.5; cursor:default; }
   #answer { margin-top:14px; padding:14px; background:var(--bg); border:1px solid var(--border); border-radius:8px; white-space:pre-wrap; min-height:24px; font-size:14px; }
   .muted { color:var(--muted); font-size:12px; }
-  code { color:var(--accent); }
+  code { color:var(--accent); word-break:break-all; }
+
+  /* ── Phone: stack the wide node table into labelled cards ── */
+  @media (max-width: 640px) {
+    header { padding:12px 16px; flex-wrap:wrap; gap:8px; }
+    header h1 { font-size:18px; }
+    main { padding:16px 14px; }
+    .grid { grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:18px; }
+    .card { padding:13px; }
+    .card .value { font-size:22px; }
+    .card .value.mode { font-size:16px; }
+    thead { position:absolute; left:-9999px; }   /* hide header row, labels move inline */
+    table, tbody, tr, td { display:block; width:100%; }
+    table { border-radius:10px; }
+    tr { border-bottom:1px solid var(--border); padding:6px 0; }
+    tr:last-child { border-bottom:none; }
+    td { border:none; padding:6px 14px; display:flex; justify-content:space-between; align-items:baseline; gap:14px; font-size:14px; text-align:right; }
+    td::before { content:attr(data-label); color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; text-align:left; flex:0 0 auto; }
+    td.empty { display:block; text-align:center; }
+    td.empty::before { content:none; }
+  }
 </style>
 </head>
 <body>
@@ -64,10 +85,12 @@ _PAGE = """<!doctype html>
   </div>
 
   <h2>Nodes</h2>
+  <div class="table-wrap">
   <table>
     <thead><tr><th>Name</th><th>Node ID</th><th>Address</th><th>gRPC</th><th>RPC</th><th>OS</th></tr></thead>
     <tbody id="nodes"><tr><td colspan="6" class="empty">No nodes registered yet.</td></tr></tbody>
   </table>
+  </div>
 
   <h2>RPC Endpoints</h2>
   <div id="rpc" class="muted">—</div>
@@ -110,12 +133,12 @@ async function refresh() {
       const alive = (n.status === 'alive' || n.status === 'discovered');
       const ip = n.ip_address || '—';
       return `<tr>
-        <td><span class="dot ${alive ? '' : 'stale'}"></span>${n.node_name ?? n.name ?? '—'}</td>
-        <td class="muted">${(n.node_id||'').slice(0,24)}</td>
-        <td>${ip}</td>
-        <td>${n.grpc_port ?? '—'}</td>
-        <td>${n.rpc_port ? n.rpc_port : '<span class="muted">off</span>'}</td>
-        <td class="muted">${n.os ?? '—'}</td>
+        <td data-label="Name"><span class="dot ${alive ? '' : 'stale'}"></span>${n.node_name ?? n.name ?? '—'}</td>
+        <td data-label="Node ID" class="muted">${(n.node_id||'').slice(0,24)}</td>
+        <td data-label="Address">${ip}</td>
+        <td data-label="gRPC">${n.grpc_port ?? '—'}</td>
+        <td data-label="RPC">${n.rpc_port ? n.rpc_port : '<span class="muted">off</span>'}</td>
+        <td data-label="OS" class="muted">${n.os ?? '—'}</td>
       </tr>`;
     }).join('');
   } catch (e) {}
