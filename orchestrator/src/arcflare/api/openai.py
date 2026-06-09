@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 import logging
@@ -132,62 +133,67 @@ async def completions(request: CompletionRequest):
 
 async def generate_chat_stream(request: ChatCompletionRequest) -> AsyncGenerator[dict, None]:
     from ..inference.pipeline import run_inference_stream
-    full_result = ""
+    # OpenAI streaming requires each SSE `data:` payload to be a JSON *string*.
+    # sse_starlette renders dicts via str() (Python repr), which is invalid JSON
+    # and breaks every OpenAI client — so we json.dumps() the chunk ourselves.
+    cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
     async for chunk in run_inference_stream(
         model=request.model,
         prompt=format_messages(request.messages),
         max_tokens=request.max_tokens,
         temperature=request.temperature,
     ):
-        full_result += chunk
-        yield {
-            "event": "delta",
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-            "data": {
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": chunk},
-                    "finish_reason": None,
-                }]
-            },
-        }
-    yield {
-        "event": "done",
-        "data": "[DONE]",
-    }
+        yield {"data": json.dumps({
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
+        })}
+    # terminal chunk + sentinel
+    yield {"data": json.dumps({
+        "id": cid,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": request.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })}
+    yield {"data": "[DONE]"}
 
 
 async def generate_completion_stream(request: CompletionRequest):
     from ..inference.pipeline import run_inference_stream
+    cid = f"cmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
     async for chunk in run_inference_stream(
         model=request.model,
         prompt=request.prompt,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
     ):
-        yield {
-            "event": "delta",
-            "data": {
-                "choices": [{
-                    "index": 0,
-                    "text": chunk,
-                    "finish_reason": None,
-                }]
-            },
-        }
-    yield {
-        "event": "done",
-        "data": "[DONE]",
-    }
+        yield {"data": json.dumps({
+            "id": cid,
+            "object": "text_completion",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "text": chunk, "finish_reason": None}],
+        })}
+    yield {"data": json.dumps({
+        "id": cid,
+        "object": "text_completion",
+        "created": created,
+        "model": request.model,
+        "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+    })}
+    yield {"data": "[DONE]"}
 
 
 def format_messages(messages: list[ChatMessage]) -> str:
     parts = []
     for msg in messages:
-        if msg.role == "system":
-            parts.append(f"System: {msg.content}")
-        elif msg.role == "user":
-            parts.append(f"User: {msg.content}")
-        elif msg.role == "assistant":
-            parts.append(f"Assistant: {msg.content}")
+        role = msg.role.capitalize() if msg.role else "User"
+        parts.append(f"{role}: {msg.content}")
+    # prime the model to continue as the assistant
+    parts.append("Assistant:")
     return "\n".join(parts)

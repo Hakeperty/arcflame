@@ -7,11 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api.openai import router as openai_router
 from .api.management import router as management_router
+from .api.dashboard import router as dashboard_router
 from .cluster.discovery import DiscoveryService
 
 logger = logging.getLogger("arcflare")
 
 discovery_service: DiscoveryService | None = None
+_background_tasks: set = set()
 
 
 @asynccontextmanager
@@ -20,14 +22,26 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting ArcFlare orchestrator...")
     discovery_service = DiscoveryService()
-    asyncio.create_task(discovery_service.start())
-    logger.info("Discovery service started on UDP port 5678")
+    # keep strong references — a bare create_task() can be garbage-collected
+    # mid-flight, silently cancelling the task and swallowing its errors
+    for coro in (discovery_service.start(), discovery_service.health_loop()):
+        task = asyncio.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    logger.info("Discovery + health monitor started")
 
     yield
 
     logger.info("Shutting down ArcFlare orchestrator...")
     if discovery_service:
         discovery_service.stop()
+    # stop the persistent llama-server child so it isn't orphaned on restart
+    try:
+        from .inference.pipeline import _pipeline
+        if _pipeline is not None:
+            await _pipeline.server.stop()
+    except Exception as e:
+        logger.debug(f"llama-server stop on shutdown: {e}")
     logger.info("Shutdown complete")
 
 
@@ -48,6 +62,7 @@ app.add_middleware(
 
 app.include_router(openai_router, prefix="/v1")
 app.include_router(management_router, prefix="/api")
+app.include_router(dashboard_router)
 
 
 @app.get("/")
@@ -56,6 +71,7 @@ async def root():
         "name": "ArcFlare",
         "version": "0.1.0",
         "status": "running",
+        "dashboard": "/dashboard",
         "docs": "/docs",
     }
 

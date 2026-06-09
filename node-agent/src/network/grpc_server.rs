@@ -201,13 +201,15 @@ impl NodeAgent for ArcFlareNodeService {
 
                         tokio::task::spawn_blocking(move || {
                             use llama_cpp_4::context::params::LlamaContextParams;
-                            use llama_cpp_4::llama_backend::LlamaBackend;
                             use llama_cpp_4::llama_batch::LlamaBatch;
                             use llama_cpp_4::model::params::LlamaModelParams;
                             use llama_cpp_4::model::{AddBos, LlamaModel, Special};
                             use std::num::NonZero;
 
-                            let be = match LlamaBackend::init() {
+                            // Use the shared process-global backend. Calling
+                            // LlamaBackend::init() here re-initializes the singleton and
+                            // errors after the first request (and races concurrent ones).
+                            let be = match crate::inference::forward::backend() {
                                 Ok(b) => b,
                                 Err(e) => {
                                     let _ = tx.blocking_send(Err(Status::internal(
@@ -217,6 +219,8 @@ impl NodeAgent for ArcFlareNodeService {
                                 }
                             };
 
+                            // TODO(perf #3): reuse the already-loaded shard model from
+                            // get_loaded_model() instead of reloading the GGUF per request.
                             let model_path = std::env::var("ARCFLARE_MODEL_PATH")
                                 .unwrap_or_else(|_| {
                                     "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf".to_string()
@@ -224,7 +228,7 @@ impl NodeAgent for ArcFlareNodeService {
 
                             let model_params = LlamaModelParams::default()
                                 .with_n_gpu_layers(999);
-                            let model = match LlamaModel::load_from_file(&be, &model_path, &model_params)
+                            let model = match LlamaModel::load_from_file(be, &model_path, &model_params)
                             {
                                 Ok(m) => m,
                                 Err(e) => {
@@ -255,7 +259,7 @@ impl NodeAgent for ArcFlareNodeService {
                             };
                             let ctx_params = LlamaContextParams::default()
                                 .with_n_ctx(Some(n_ctx));
-                            let mut ctx = match model.new_context(&be, ctx_params) {
+                            let mut ctx = match model.new_context(be, ctx_params) {
                                 Ok(c) => c,
                                 Err(e) => {
                                     let _ = tx.blocking_send(Err(Status::internal(
@@ -280,14 +284,18 @@ impl NodeAgent for ArcFlareNodeService {
                                 return;
                             }
 
+                            // total_cmp gives a total ordering — partial_cmp().unwrap()
+                            // panics if any logit is NaN.
                             let argmax = |logits: &[f32]| -> i32 {
                                 logits.iter()
                                     .enumerate()
-                                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
                                     .map(|(i, _)| i as i32)
                                     .unwrap_or(0)
                             };
 
+                            // the model's real end-of-generation token (was hardcoded 2)
+                            let eos_id = model.token_eos().0;
                             let mut last_token = llama_cpp_4::token::LlamaToken(0);
                             for pos in 0..max_tokens {
                                 if last_token.0 != 0 {
@@ -320,7 +328,7 @@ impl NodeAgent for ArcFlareNodeService {
                                     break;
                                 }
 
-                                if sampled_id == 2 { break; }
+                                if sampled_id == eos_id { break; }
                             }
 
                             let _ = tx.blocking_send(Ok(ForwardResponse {

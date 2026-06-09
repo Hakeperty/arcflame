@@ -19,7 +19,10 @@ impl RpcServer {
         }
     }
 
-    /// Start `llama-rpc-server -p <port>` as a child process.
+    /// Start `llama-rpc-server -H 0.0.0.0 -p <port>` as a child process.
+    ///
+    /// `-H 0.0.0.0` is required: rpc-server defaults to binding 127.0.0.1, which
+    /// makes it unreachable from an orchestrator running on a different machine.
     pub async fn start(&self) -> Result<(), String> {
         let mut guard = self.process.lock().await;
         if guard.is_some() {
@@ -27,12 +30,17 @@ impl RpcServer {
         }
 
         let child = tokio::process::Command::new(&self.bin)
+            .arg("-H")
+            .arg("0.0.0.0")
             .arg("-p")
             .arg(self.port.to_string())
+            // backstop: if the handle is dropped without an explicit stop(),
+            // the child is killed instead of being orphaned (holds the port)
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("Failed to spawn rpc-server ({}): {}", self.bin.display(), e))?;
 
-        info!("llama rpc-server started on port {}", self.port);
+        info!("llama rpc-server started on 0.0.0.0:{}", self.port);
         *guard = Some(child);
         Ok(())
     }

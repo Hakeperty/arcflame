@@ -2,65 +2,77 @@ import asyncio
 import logging
 import os
 import random
-import shutil
+from functools import lru_cache
 from typing import AsyncGenerator, Optional
 
 from .grpc_client import NodeGrpcClient
+from .llama_server import LlamaServerManager
 
 logger = logging.getLogger("arcflare.inference")
+
+
+def _models_dir() -> str:
+    return os.path.abspath(os.environ.get(
+        "ARCFLARE_MODELS_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"),
+    ))
+
+
+@lru_cache(maxsize=1)
+def _find_llama_cli_cached() -> Optional[str]:
+    candidates = [
+        os.environ.get("ARCFLARE_LLAMA_CLI", ""),
+        "/usr/local/bin/llama-cli",
+        "/opt/llama/bin/llama-cli",
+        "/usr/local/bin/llama",
+        "/app/llama-cli",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 
 class InferencePipeline:
     """Coordinates distributed inference across the cluster.
 
     Pipeline modes (tried in order):
-    1. RPC distributed — orchestrator runs llama-cli with --rpc <node1>,<node2>,...
-       Each node must run llama-rpc-server (--enable-rpc on the node agent).
-       Requires 1+ nodes with rpc_port set. llama-cli keeps all computation on
-       the nodes; the model is split by tensor automatically.
-    2. gRPC streaming — sends generation to one node via our ForwardStream proto.
-    3. Local fallback — runs llama-cli subprocess on the orchestrator itself.
+    1. llama-server (persistent) — a single long-lived server loads the model
+       once and streams tokens over HTTP. `--rpc <ep1>,<ep2>` makes it split
+       tensors across the cluster (distributed); with no endpoints it runs
+       locally. This avoids reloading the model on every request.
+    2. llama-cli subprocess — fallback that runs `llama-cli [--rpc ...]` once per
+       request (reloads the model each time). Used only if llama-server is absent.
+    3. gRPC ForwardStream — custom per-node streaming protocol.
+    4. Stub — no binary/model available.
     """
 
     def __init__(self):
-        self.active_pipelines: dict = {}
         self.node_connections: dict[str, NodeGrpcClient] = {}
+        self.server = LlamaServerManager()
+
+    # ─── lookups (cached) ───
 
     def _find_model(self, model_name: str) -> Optional[str]:
-        models_dir = os.environ.get(
-            "ARCFLARE_MODELS_DIR",
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"),
-        )
-        models_dir = os.path.abspath(models_dir)
-
-        for fname in os.listdir(models_dir):
-            if fname.endswith(".gguf"):
-                return os.path.join(models_dir, fname)
-
-        return None
+        """Resolve a model name to a .gguf path. Uses the name when it matches a
+        file; otherwise falls back to the first model (sorted, deterministic)."""
+        models_dir = _models_dir()
+        if not os.path.isdir(models_dir):
+            return None
+        ggufs = sorted(f for f in os.listdir(models_dir) if f.endswith(".gguf"))
+        if not ggufs:
+            return None
+        wanted = (model_name or "").split("/")[-1].removesuffix(".gguf").lower()
+        if wanted and wanted != "default":
+            for f in ggufs:
+                if wanted in f.lower():
+                    return os.path.join(models_dir, f)
+        return os.path.join(models_dir, ggufs[0])
 
     def _find_llama_cli(self) -> Optional[str]:
-        candidates = [
-            os.environ.get("ARCFLARE_LLAMA_CLI", ""),
-            "/usr/local/bin/llama-cli",
-            "/usr/local/bin/llama",
-            "/tmp/llama-cli",
-            "/app/llama-cli",
-            "/app/llama",
-        ]
-        for path in candidates:
-            if path and os.path.isfile(path) and os.access(path, os.X_OK):
-                return path
-        return None
-
-    def _get_models_dir(self) -> str:
-        return os.environ.get(
-            "ARCFLARE_MODELS_DIR",
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"),
-        )
+        return _find_llama_cli_cached()
 
     async def _connect_to_nodes(self, nodes: list[dict]):
-        """Establish gRPC connections to available nodes."""
         for node in nodes:
             node_id = node.get("node_id", "")
             if node_id and node_id not in self.node_connections:
@@ -68,329 +80,204 @@ class InferencePipeline:
                 port = node.get("grpc_port", 9001)
                 if ip and port:
                     client = NodeGrpcClient(node_id, ip, port)
-                    ok = await client.connect()
-                    if ok:
+                    if await client.connect():
                         self.node_connections[node_id] = client
                         logger.info(f"gRPC connected to node {node_id}")
 
-    async def run(
-        self,
-        model: str,
-        prompt: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
-    ) -> str:
+    # ─── public API ───
+
+    async def run(self, model: str, prompt: str, max_tokens: int = 1024,
+                  temperature: float = 0.7) -> str:
         tokens = []
         async for token in self.run_stream(model, prompt, max_tokens, temperature):
             tokens.append(token)
         return "".join(tokens)
 
-    async def run_stream(
-        self,
-        model: str,
-        prompt: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
-    ) -> AsyncGenerator[str, None]:
+    async def run_stream(self, model: str, prompt: str, max_tokens: int = 1024,
+                         temperature: float = 0.7) -> AsyncGenerator[str, None]:
         from ..main import discovery_service
 
         nodes = discovery_service.get_nodes() if discovery_service else []
         rpc_endpoints = discovery_service.get_rpc_endpoints() if discovery_service else []
+        model_path = self._find_model(model)
 
-        # Mode 1: RPC distributed — requires at least one rpc-server endpoint
-        if rpc_endpoints:
-            logger.info(f"RPC distributed mode: {len(rpc_endpoints)} endpoint(s): {rpc_endpoints}")
+        # Mode 1: persistent llama-server (handles both distributed and local)
+        if model_path and self.server.available:
+            mode = f"rpc_distributed ({len(rpc_endpoints)} nodes)" if rpc_endpoints else "local"
+            logger.info(f"llama-server mode [{mode}], model={model_path}")
             try:
-                async for token in self._rpc_distributed_inference(
-                    model, prompt, max_tokens, temperature, rpc_endpoints
-                ):
-                    yield token
+                if await self.server.ensure(model_path, rpc_endpoints):
+                    async for tok in self.server.stream_completion(prompt, max_tokens, temperature):
+                        yield tok
+                    return
+                logger.warning("llama-server not ready, falling back")
+            except Exception as e:
+                logger.warning(f"llama-server inference failed ({e}), falling back")
+
+        # Mode 2: one-shot llama-cli (with --rpc if endpoints exist)
+        if model_path and self._find_llama_cli():
+            try:
+                async for tok in self._llama_cli_inference(
+                    model_path, prompt, max_tokens, temperature, rpc_endpoints):
+                    yield tok
                 return
             except Exception as e:
-                logger.warning(f"RPC distributed inference failed ({e}), falling back")
+                logger.warning(f"llama-cli inference failed ({e}), falling back")
 
-        # Mode 2: gRPC streaming to a single node
+        # Mode 3: gRPC streaming to a connected node
         alive = [n for n in nodes if n.get("grpc_port") and n.get("ip_address")]
-        active_connections = list(self.node_connections.keys())
-        if alive and active_connections:
-            logger.info(f"gRPC stream mode: {len(alive)} nodes available")
-            try:
-                await self._connect_to_nodes(alive)
-                async for token in self._distributed_inference(
-                    model, prompt, max_tokens, temperature, alive
-                ):
-                    yield token
-                return
-            except Exception as e:
-                logger.warning(f"gRPC inference failed ({e}), falling back to local")
+        if alive:
+            await self._connect_to_nodes(alive)
+            if self.node_connections:
+                logger.info(f"gRPC stream mode: {len(alive)} nodes")
+                try:
+                    async for tok in self._distributed_inference(
+                        model, prompt, max_tokens, temperature, alive):
+                        yield tok
+                    return
+                except Exception as e:
+                    logger.warning(f"gRPC inference failed ({e}), falling back")
 
-        # Mode 3: local llama-cli
-        logger.info("Local inference mode")
-        async for token in self._local_inference(prompt, max_tokens, temperature):
-            yield token
+        # Mode 4: stub
+        logger.info("No inference backend available — stub response")
+        async for tok in self._stub(prompt):
+            yield tok
 
-    # ─── RPC distributed inference ───
+    # ─── llama-cli fallback (one-shot) ───
 
-    async def _rpc_distributed_inference(
-        self,
-        model: str,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
+    async def _llama_cli_inference(
+        self, model_path: str, prompt: str, max_tokens: int, temperature: float,
         rpc_endpoints: list[str],
     ) -> AsyncGenerator[str, None]:
-        """Run llama-cli with --rpc pointing at all node rpc-servers.
-
-        llama-cli offloads tensor shards to each rpc-server automatically,
-        distributing model layers across the cluster.
-        """
-        model_path = self._find_model(model)
         llama_cli = self._find_llama_cli()
-
-        if not model_path:
-            raise RuntimeError("No model found for RPC inference")
-        if not llama_cli:
-            raise RuntimeError("llama-cli binary not found for RPC inference")
-
-        rpc_arg = ",".join(rpc_endpoints)
-        logger.info(f"Invoking llama-cli --rpc {rpc_arg} with model {model_path}")
-
-        cmd = [
-            llama_cli,
-            "-m", model_path,
-            "--rpc", rpc_arg,
-            "-p", prompt,
-            "-n", str(max_tokens),
-            "--no-display-prompt",
-            "--single-turn",
-        ]
-
+        cmd = [llama_cli, "-m", model_path, "-p", prompt, "-n", str(max_tokens),
+               "--no-display-prompt", "--single-turn"]
+        if rpc_endpoints:
+            cmd += ["--rpc", ",".join(rpc_endpoints)]
         if temperature > 0:
             cmd += ["--temp", str(temperature)]
-        else:
-            cmd += ["--greedy"]
 
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(), timeout=600
-            )
-
+            stdout_data, stderr_data = await asyncio.wait_for(proc.communicate(), timeout=600)
             if proc.returncode != 0:
-                stderr_text = stderr_data.decode("utf-8", errors="replace")
-                raise RuntimeError(f"llama-cli exited {proc.returncode}: {stderr_text[:200]}")
+                err = stderr_data.decode("utf-8", errors="replace")[:200]
+                raise RuntimeError(f"llama-cli exited {proc.returncode}: {err}")
+            for line in self._strip_banner(stdout_data.decode("utf-8", errors="replace")):
+                yield line
+                await asyncio.sleep(0.005)
+        except asyncio.TimeoutError:
+            logger.error("llama-cli timed out")
+            raise RuntimeError("inference timed out")
+        finally:
+            # always reap the child — on timeout, early-return, or consumer disconnect
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
 
-            output = stdout_data.decode("utf-8", errors="replace")
-            for line in output.split("\n"):
-                clean = line.strip()
+    @staticmethod
+    def _strip_banner(output: str):
+        """Extract model output from llama-cli's noisy stdout (banner/spinner/footer)."""
+        capturing = False
+        for line in output.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not capturing and stripped.startswith("> "):
+                capturing = True
+                continue
+            if capturing and (stripped.startswith("[") or stripped.startswith("Exiting")):
+                break
+            if capturing:
+                clean = stripped.lstrip("|/-\\").replace("\b", "").replace("\r", "").strip()
                 if clean:
                     yield clean + "\n"
-                    await asyncio.sleep(0.005)
 
-        except asyncio.TimeoutError:
-            logger.error("llama-cli RPC inference timed out")
-            raise RuntimeError("RPC inference timed out")
+    # ─── gRPC pipeline ───
 
-    # ─── gRPC pipeline (single-node fallback) ───
-
-    async def _load_shards_on_nodes(
-        self, model_path: str, nodes: list[dict]
-    ) -> bool:
+    async def _load_shards_on_nodes(self, model_path: str, nodes: list[dict]) -> bool:
         loaded = 0
-        for node in nodes:
-            node_id = node.get("node_id", "")
-            client = self.node_connections.get(node_id)
+        total_layers = self._get_model_layer_count(model_path) or 24
+        n_nodes = max(1, len(nodes))
+        layers_per = total_layers // n_nodes
+        for idx, node in enumerate(nodes):
+            client = self.node_connections.get(node.get("node_id", ""))
             if not client:
                 continue
-            total_layers = self._get_model_layer_count(model_path) or 24
-            n_nodes = max(1, len(nodes))
-            layers_per = total_layers // n_nodes
-            first = nodes.index(node) * layers_per
-            num = layers_per if nodes.index(node) < n_nodes - 1 else total_layers - first
-            has_head = nodes.index(node) == n_nodes - 1
-
+            first = idx * layers_per
+            is_last = idx == n_nodes - 1
+            num = total_layers - first if is_last else layers_per
             status = await client.load_shard(
-                model_name="arcflare/default",
-                gguf_path=model_path,
-                first_layer=first,
-                num_layers=num,
-                has_lm_head=has_head,
-            )
+                model_name="arcflare/default", gguf_path=model_path,
+                first_layer=first, num_layers=num, has_lm_head=is_last)
             if status and status.loaded:
                 loaded += 1
         return loaded > 0
 
+    @lru_cache(maxsize=8)
     def _get_model_layer_count(self, model_path: str) -> Optional[int]:
         try:
             import subprocess
-            result = subprocess.run(
-                ["gguf-splitter", "--model", model_path],
-                capture_output=True, text=True, timeout=10,
-            )
+            result = subprocess.run(["gguf-splitter", "--model", model_path],
+                                    capture_output=True, text=True, timeout=10)
             for line in result.stdout.split("\n"):
                 if line.startswith("Total layers:"):
                     return int(line.split(":")[1].strip())
         except Exception:
             pass
-        file_size = os.path.getsize(model_path)
-        if file_size < 1_000_000_000:
-            return 24
-        return 32
+        return 24 if os.path.getsize(model_path) < 1_000_000_000 else 32
 
-    async def _distributed_inference(
-        self,
-        model: str,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
-        nodes: list[dict],
-    ) -> AsyncGenerator[str, None]:
+    async def _distributed_inference(self, model, prompt, max_tokens, temperature, nodes):
         model_path = self._find_model(model)
         if not model_path:
-            logger.warning("No model found for distributed inference")
+            logger.warning("No model for gRPC inference, using stub")
+            async for tok in self._stub(prompt):
+                yield tok
             return
-
         await self._connect_to_nodes(nodes)
-        shards_loaded = await self._load_shards_on_nodes(model_path, nodes)
-
-        if shards_loaded:
-            logger.info("Shards loaded on nodes, trying gRPC inference")
-            async for token in self._grpc_inference(prompt, max_tokens, temperature, nodes):
-                yield token
+        if await self._load_shards_on_nodes(model_path, nodes):
+            async for tok in self._grpc_inference(prompt, max_tokens, temperature, nodes):
+                yield tok
             return
+        logger.info("gRPC shard load failed, using stub")
+        async for tok in self._stub(prompt):
+            yield tok
 
-        logger.info("gRPC shard loading failed, using local llama-cli")
-        async for token in self._local_inference(prompt, max_tokens, temperature):
-            yield token
-
-    async def _grpc_inference(
-        self,
-        prompt: str,
-        max_tokens: int,
-        temperature: float,
-        nodes: list[dict],
-    ) -> AsyncGenerator[str, None]:
+    async def _grpc_inference(self, prompt, max_tokens, temperature, nodes):
         target = self._pick_target_node(nodes)
-        if not target:
-            logger.warning("No available node for inference")
-            return
-
-        node_id = target.get("node_id", "")
-        client = self.node_connections.get(node_id)
+        client = self.node_connections.get(target.get("node_id", "")) if target else None
         if not client:
-            logger.warning(f"Node {node_id} not connected")
+            logger.warning("No connected node for gRPC inference")
+            async for tok in self._stub(prompt):
+                yield tok
             return
-
-        logger.info(f"Streaming inference to node {node_id}")
-
         try:
             async for chunk in client.forward_stream(
-                text_prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ):
+                text_prompt=prompt, max_tokens=max_tokens, temperature=temperature):
                 if chunk.logits:
-                    text = chunk.logits.decode("utf-8", errors="replace")
-                    for char in text:
-                        yield char
-                        await asyncio.sleep(0.005)
+                    yield chunk.logits.decode("utf-8", errors="replace")
                 elif not chunk.has_logits:
                     break
         except Exception as e:
-            logger.warning(f"gRPC streaming inference failed: {e}")
-            logger.info("Falling back to local inference")
-            async for token in self._local_inference(prompt, max_tokens, temperature):
-                yield token
+            logger.warning(f"gRPC streaming failed: {e}")
+            raise
 
     def _pick_target_node(self, nodes: list[dict]) -> Optional[dict]:
-        connected = [
-            n for n in nodes
-            if n.get("node_id", "") in self.node_connections
-        ]
-        if not connected:
-            return None
-        return random.choice(connected)
+        connected = [n for n in nodes if n.get("node_id", "") in self.node_connections]
+        return random.choice(connected) if connected else None
 
-    # ─── Local fallback ───
+    # ─── stub ───
 
-    async def _local_inference(
-        self,
-        prompt: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
-    ) -> AsyncGenerator[str, None]:
-        model_path = self._find_model("default")
-        llama_cli = self._find_llama_cli()
-
-        if not model_path or not llama_cli:
-            logger.warning(f"Model ({model_path}) or llama-cli ({llama_cli}) not found — using stub")
-            response = (
-                f"[ArcFlare local mode]\n"
-                f"Received prompt ({len(prompt)} chars). "
-                f"Install llama-cli and a GGUF model for real inference.\n"
-            )
-            for char in response:
-                yield char
-                await asyncio.sleep(0.01)
-            return
-
-        logger.info(f"Running llama-cli with model: {model_path}")
-        cmd = [
-            llama_cli,
-            "-m", model_path,
-            "-p", prompt,
-            "-n", str(max_tokens),
-            "--no-display-prompt",
-            "--single-turn",
-        ]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout_data, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=600
-            )
-
-            output = stdout_data.decode("utf-8", errors="replace")
-            lines = output.split("\n")
-            capturing = False
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if not capturing and stripped.startswith("> "):
-                    capturing = True
-                    continue
-                if capturing and stripped.startswith("["):
-                    break
-                if capturing and stripped.startswith("/"):
-                    continue
-                if capturing and stripped:
-                    if any(stripped.startswith(c) for c in ("|", "/", "-", "\\", "=")):
-                        stripped = stripped.lstrip("|/-\\=").lstrip("\b \b").strip()
-                    clean = stripped.replace("\b", "").replace("\r", "").strip()
-                    if clean and not clean.startswith(">") and not clean.startswith("Exiting"):
-                        yield clean + "\n"
-                        await asyncio.sleep(0.01)
-
-        except asyncio.TimeoutError:
-            logger.error("llama-cli timed out")
-            yield "\n[Inference timed out]\n"
-        except FileNotFoundError:
-            logger.error("llama-cli binary not found")
-            yield "\n[llama-cli not found]\n"
-        except Exception as e:
-            logger.error(f"Inference error: {e}")
-            yield f"\n[Error: {e}]\n"
+    async def _stub(self, prompt: str) -> AsyncGenerator[str, None]:
+        msg = (f"[ArcFlare] No inference backend available for a {len(prompt)}-char prompt. "
+               f"Install llama-server/llama-cli and provide a GGUF model.\n")
+        for chunk in msg.split(" "):
+            yield chunk + " "
+            await asyncio.sleep(0.01)
 
 
 _pipeline: Optional[InferencePipeline] = None
@@ -403,22 +290,12 @@ def get_pipeline() -> InferencePipeline:
     return _pipeline
 
 
-async def run_inference(
-    model: str,
-    prompt: str,
-    max_tokens: int = 1024,
-    temperature: float = 0.7,
-) -> str:
-    pipeline = get_pipeline()
-    return await pipeline.run(model, prompt, max_tokens, temperature)
+async def run_inference(model: str, prompt: str, max_tokens: int = 1024,
+                        temperature: float = 0.7) -> str:
+    return await get_pipeline().run(model, prompt, max_tokens, temperature)
 
 
-async def run_inference_stream(
-    model: str,
-    prompt: str,
-    max_tokens: int = 1024,
-    temperature: float = 0.7,
-) -> AsyncGenerator[str, None]:
-    pipeline = get_pipeline()
-    async for token in pipeline.run_stream(model, prompt, max_tokens, temperature):
+async def run_inference_stream(model: str, prompt: str, max_tokens: int = 1024,
+                               temperature: float = 0.7) -> AsyncGenerator[str, None]:
+    async for token in get_pipeline().run_stream(model, prompt, max_tokens, temperature):
         yield token

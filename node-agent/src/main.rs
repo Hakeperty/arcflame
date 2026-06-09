@@ -21,10 +21,11 @@ struct Args {
     #[arg(short, long)]
     name: Option<String>,
 
-    #[arg(short, long, default_value = "8000")]
+    // long-only: -o would collide between orchestrator_port and orchestrator_host
+    #[arg(long, default_value = "8000")]
     orchestrator_port: u16,
 
-    #[arg(short, long)]
+    #[arg(long)]
     orchestrator_host: Option<String>,
 
     #[arg(long, default_value = "info")]
@@ -56,7 +57,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| hostname_cached.clone());
-    let node_id = format!("{}-{}", machine_id, args.grpc_port);
+    // Include the hostname: machines imaged/cloned from one disk share a
+    // machine-id, so machine_id+port alone collides across cloned nodes (common
+    // on "flash one SD card, clone it" scrap-hardware setups). hostname is
+    // distinct per node and keeps node_id stable + unique.
+    let node_id = format!("{}-{}-{}", machine_id, hostname_cached, args.grpc_port);
     let hostname = hostname_cached;
 
     let hardware_report = hardware::collect().await?;
@@ -67,23 +72,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         hardware_report.memory.as_ref().map_or(0, |m| m.total_bytes),
     );
 
-    // Determine effective RPC port
+    // Determine effective RPC port (saturating_add avoids debug-build overflow panic)
     let rpc_port: u16 = if args.enable_rpc {
-        args.rpc_port.unwrap_or(args.grpc_port + 1000)
+        args.rpc_port.unwrap_or_else(|| args.grpc_port.saturating_add(1000))
     } else {
         0
     };
 
-    // Start llama.cpp rpc-server if requested
-    if args.enable_rpc {
+    // Start llama.cpp rpc-server if requested. Keep it OWNED (not leaked) so it
+    // can be stopped on shutdown instead of orphaning the child process.
+    let rpc_server = if args.enable_rpc {
         let rpc = inference::rpc::RpcServer::new(rpc_port, args.rpc_server_bin.clone());
         match rpc.start().await {
             Ok(()) => tracing::info!("llama rpc-server running on port {}", rpc_port),
             Err(e) => tracing::warn!("Could not start rpc-server: {} (continuing without it)", e),
         }
-        // Keep server alive for the process lifetime (leak is intentional here)
-        Box::leak(Box::new(rpc));
-    }
+        Some(rpc)
+    } else {
+        None
+    };
 
     let addr: SocketAddr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
 
@@ -99,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         node_name_clone,
         grpc_port,
         rpc_port,
-        shutdown,
+        shutdown.clone(),
     );
 
     // Register with orchestrator via HTTP
@@ -114,6 +121,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "rpc_port": rpc_port,
             "version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
+            // compact hardware summary so the orchestrator can report cluster RAM/GPU
+            "hardware": {
+                "cpu_cores": hardware_report.cpu.as_ref().map_or(0, |c| c.cores),
+                "ram_bytes": hardware_report.memory.as_ref().map_or(0, |m| m.total_bytes),
+                "gpu_count": hardware_report.gpus.len(),
+            },
         });
         match client.post(&reg_url).json(&payload).send().await {
             Ok(resp) => {
@@ -139,7 +152,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::info!("Node agent starting on {}", addr);
 
-    network::grpc_server::serve(node_svc, addr).await
+    // Serve until the gRPC server returns or a shutdown signal arrives, then
+    // clean up: stop the broadcaster and kill the rpc-server child.
+    let result = tokio::select! {
+        res = network::grpc_server::serve(node_svc, addr) => res,
+        _ = shutdown_signal() => {
+            tracing::info!("Shutdown signal received, stopping node agent");
+            Ok(())
+        }
+    };
+
+    *shutdown.write().await = true;
+    if let Some(rpc) = rpc_server {
+        rpc.stop().await;
+        tracing::info!("rpc-server stopped");
+    }
+
+    result
+}
+
+/// Resolves when the process receives Ctrl-C or (on Unix) SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn hostname() -> String {
