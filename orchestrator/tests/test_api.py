@@ -69,6 +69,20 @@ def test_pipeline_mode_transitions(client):
     assert client.get("/api/cluster/status").json()["pipeline_mode"] == "single_rpc"
 
 
+def test_request_bounds_reject_abuse(client):
+    # max_tokens DoS guard + empty-message guard (422 from validation)
+    assert client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10_000_000,
+    }).status_code == 422
+    assert client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [],
+    }).status_code == 422
+    assert client.post("/v1/completions", json={
+        "model": "m", "prompt": "x", "max_tokens": -5,
+    }).status_code == 422
+
+
 def test_chat_completions_nonstream(client, monkeypatch):
     async def fake_run(model, prompt, max_tokens, temperature):
         return "Paris."

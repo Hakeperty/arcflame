@@ -42,6 +42,16 @@ struct Args {
     /// Path to llama-rpc-server binary.
     #[arg(long, default_value = "llama-rpc-server")]
     rpc_server_bin: PathBuf,
+
+    /// Allow remote callers to apply safe CPU/system tuning (governor, swappiness,
+    /// hugepages, I/O scheduler). Off by default — the gRPC API is unauthenticated.
+    #[arg(long, default_value = "false")]
+    allow_tuning: bool,
+
+    /// Allow remote callers to apply AGGRESSIVE tuning (CPU undervolt, raised TDP,
+    /// GPU power-limit/clock changes). Off by default; can destabilize/damage hardware.
+    #[arg(long, default_value = "false")]
+    allow_aggressive: bool,
 }
 
 #[tokio::main]
@@ -142,12 +152,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    if args.allow_aggressive {
+        tracing::warn!("--allow-aggressive enabled: remote callers can undervolt/overclock this machine");
+    } else if args.allow_tuning {
+        tracing::info!("--allow-tuning enabled: remote callers can apply safe system tuning");
+    }
+
     let node_svc = network::grpc_server::ArcFlareNodeService::new(
         node_id,
         node_name,
         hardware_report,
         addr,
         rpc_port,
+        args.allow_tuning,
+        args.allow_aggressive,
     );
 
     tracing::info!("Node agent starting on {}", addr);

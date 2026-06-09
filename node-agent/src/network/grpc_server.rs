@@ -21,6 +21,12 @@ pub struct ArcFlareNodeService {
     hardware_report: HardwareReport,
     _addr: SocketAddr,
     rpc_port: u16,
+    // Opt-in gates: the gRPC server is unauthenticated, so system- and
+    // hardware-modifying RPCs are refused unless the operator explicitly
+    // enabled them at launch. Prevents a LAN peer from overclocking/undervolting
+    // or retuning the kernel on this machine.
+    allow_tuning: bool,
+    allow_aggressive: bool,
 }
 
 impl ArcFlareNodeService {
@@ -30,8 +36,18 @@ impl ArcFlareNodeService {
         hardware_report: HardwareReport,
         addr: SocketAddr,
         rpc_port: u16,
+        allow_tuning: bool,
+        allow_aggressive: bool,
     ) -> Self {
-        Self { node_id, node_name, hardware_report, _addr: addr, rpc_port }
+        Self {
+            node_id,
+            node_name,
+            hardware_report,
+            _addr: addr,
+            rpc_port,
+            allow_tuning,
+            allow_aggressive,
+        }
     }
 }
 
@@ -86,6 +102,21 @@ impl NodeAgent for ArcFlareNodeService {
         let mode_id = req.mode;
         info!("Setting performance mode to: {:?}", Mode::try_from(mode_id));
 
+        // Gate hardware/system changes behind launch-time opt-in (unauthenticated RPC).
+        match Mode::try_from(mode_id) {
+            Ok(Mode::Safe) if !self.allow_tuning => {
+                return Err(Status::permission_denied(
+                    "safe tuning disabled; start the agent with --allow-tuning",
+                ));
+            }
+            Ok(Mode::Aggressive) if !self.allow_aggressive => {
+                return Err(Status::permission_denied(
+                    "aggressive overclock/undervolt disabled; start the agent with --allow-aggressive",
+                ));
+            }
+            _ => {}
+        }
+
         let result = match Mode::try_from(mode_id) {
             Ok(Mode::Safe) => crate::overclocking::safe::apply_safe_tuning().await,
             Ok(Mode::Aggressive) => crate::overclocking::aggressive::apply_aggressive_tuning().await,
@@ -128,6 +159,11 @@ impl NodeAgent for ArcFlareNodeService {
         &self,
         request: Request<TuningRequest>,
     ) -> Result<Response<TuningResponse>, Status> {
+        if !self.allow_tuning {
+            return Err(Status::permission_denied(
+                "system tuning disabled; start the agent with --allow-tuning",
+            ));
+        }
         let req = request.into_inner();
         let result = crate::tuning::apply_tuning(req).await;
         Ok(Response::new(result))

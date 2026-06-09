@@ -5,7 +5,10 @@ import logging
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# clamp generation length so a single request can't pin a worker indefinitely
+MAX_TOKENS_LIMIT = 8192
 from sse_starlette.sse import EventSourceResponse
 
 logger = logging.getLogger("arcflare.api.openai")
@@ -22,18 +25,18 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: list[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 1024
+    messages: list[ChatMessage] = Field(min_length=1)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=1024, ge=1, le=MAX_TOKENS_LIMIT)
     stream: bool = False
-    top_p: float = 1.0
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class CompletionRequest(BaseModel):
     model: str
-    prompt: str
-    max_tokens: int = 1024
-    temperature: float = 0.7
+    prompt: str = Field(min_length=1)
+    max_tokens: int = Field(default=1024, ge=1, le=MAX_TOKENS_LIMIT)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     stream: bool = False
 
 

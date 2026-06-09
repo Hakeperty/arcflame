@@ -277,6 +277,14 @@ times out while serving) is kept. When a node disappears, the persistent
 crashed worker degrades the cluster instead of breaking it. `/api/cluster/status`
 reports a `degraded` count.
 
+## Security
+
+ArcFlare assumes a **trusted LAN** — the orchestrator API and node-agent gRPC
+server are unauthenticated. Don't expose them to the internet. Hardware/system
+tuning is **opt-in**: a node only honors remote overclock/undervolt/tuning
+requests if started with `--allow-tuning` or `--allow-aggressive` (default off,
+so a LAN peer can't retune your hardware). See [SECURITY.md](SECURITY.md).
+
 ## Auto-Discovery
 
 Nodes on the same LAN automatically find each other:
